@@ -161,12 +161,17 @@ button.mini.done{background:var(--ok)}
   </div>
 
   <div class="card">
-    <div class="row">
+    <div class="row" id="plnormal">
       <select id="plsel" style="min-width:190px"></select>
       <button class="ghost mini" id="plnew">+ New</button>
       <button class="ghost mini" id="plrename">Rename</button>
       <button class="ghost mini" id="pldel">Delete</button>
       <span class="meta" id="plcount" style="margin-left:auto"></span>
+    </div>
+    <div class="row" id="pledit" style="display:none">
+      <input type="text" id="plname" placeholder="Playlist name" maxlength="80">
+      <button class="mini" id="plsave">Save</button>
+      <button class="ghost mini" id="plcancel">Cancel</button>
     </div>
     <div class="row" style="margin-top:10px">
       <input type="text" id="pladd" placeholder="Paste a video or playlist link to add…">
@@ -469,23 +474,57 @@ async function playFrom(idx){
 }
 
 $('plsel').onchange=()=>{ CURPL=PLS.find(p=>p.id===$('plsel').value)||null; NOWIDX=-1; renderItems(); };
-$('plnew').onclick=async()=>{
-  const name=prompt('Playlist name:','My playlist'); if(!name) return;
-  const j=await api('/api/playlists',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({name})});
-  loadPlaylists(j.playlist.id);
+/* Electron defines window.prompt but calling it throws "prompt() is not
+   supported", so the New and Rename buttons silently did nothing. Inline
+   editor instead - no dialogs anywhere in this UI. */
+let EDITMODE=null;
+function openEdit(mode,val){
+  EDITMODE=mode;
+  $('plnormal').style.display='none'; $('pledit').style.display='flex';
+  $('plname').value=val||''; $('plname').focus(); $('plname').select();
+}
+function closeEdit(){
+  EDITMODE=null; $('pledit').style.display='none'; $('plnormal').style.display='flex';
+}
+$('plnew').onclick=()=>openEdit('new','');
+$('plrename').onclick=()=>{ if(CURPL) openEdit('rename',CURPL.name); };
+$('plcancel').onclick=closeEdit;
+$('plsave').onclick=async()=>{
+  const name=$('plname').value.trim(); if(!name) return;
+  try{
+    if(EDITMODE==='new'){
+      const j=await api('/api/playlists',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+      closeEdit(); await loadPlaylists(j.playlist.id);
+      plmsg('created "'+name+'"','ok'); setTimeout(()=>plmsg(''),2000);
+    } else if(CURPL){
+      await api(`/api/playlists/${CURPL.id}/rename`,{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+      closeEdit(); await loadPlaylists(CURPL.id);
+    }
+  }catch(e){ plmsg(e.message,'err'); }
 };
-$('plrename').onclick=async()=>{
-  if(!CURPL) return; const name=prompt('Rename playlist:',CURPL.name); if(!name) return;
-  await api(`/api/playlists/${CURPL.id}/rename`,{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
-  loadPlaylists(CURPL.id);
-};
+$('plname').addEventListener('keydown',e=>{
+  if(e.key==='Enter'){ e.preventDefault(); $('plsave').click(); }
+  if(e.key==='Escape'){ e.preventDefault(); closeEdit(); }
+});
+
+/* two-step delete rather than confirm() - keeps every interaction inline */
+let DELARM=false, DELT=null;
+function disarmDel(){ DELARM=false; clearTimeout(DELT);
+  $('pldel').textContent='Delete'; $('pldel').classList.remove('tog','on'); }
 $('pldel').onclick=async()=>{
   if(!CURPL) return;
-  if(!confirm(`Delete "${CURPL.name}"? This cannot be undone.`)) return;
-  await api(`/api/playlists/${CURPL.id}`,{method:'DELETE'});
-  CURPL=null; loadPlaylists();
+  if(!DELARM){
+    DELARM=true; $('pldel').textContent='Confirm delete';
+    $('pldel').classList.add('tog','on');
+    DELT=setTimeout(disarmDel,4000); return;
+  }
+  disarmDel();
+  try{
+    await api(`/api/playlists/${CURPL.id}`,{method:'DELETE'});
+    CURPL=null; await loadPlaylists();
+  }catch(e){ plmsg(e.message,'err'); }
 };
 $('pladdbtn').onclick=async()=>{
   if(!CURPL) return plmsg('create a playlist first','err');
