@@ -366,10 +366,34 @@ const shuffled = n => { const a = [...Array(n).keys()];
   for (let i = n - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
   return a; };
 
-function queueItems() {
-  if (!S.queue) return [];
-  const pl = PL.get(S.queue.playlistId);
-  return pl ? pl.items : [];
+/* The queue holds its own copy of the items rather than pointing at a playlist.
+   That lets you append arbitrary videos to what is playing without touching -
+   or even having - a saved playlist. */
+const queueItems = () => (S.queue ? S.queue.items : []);
+
+function ensureQueue() {
+  if (S.queue) return S.queue;
+  const items = [];
+  if (S.media && S.media.video_id) {      // seed from whatever is already playing
+    items.push({ video_id: S.media.video_id, title: S.media.title,
+      duration: S.media.duration, url: 'https://www.youtube.com/watch?v=' + S.media.video_id,
+      thumb: `https://i.ytimg.com/vi/${S.media.video_id}/mqdefault.jpg` });
+  }
+  S.queue = { playlistId: null, name: 'Queue', items, order: items.map((_, i) => i),
+              pos: 0, repeat: 'off', shuffle: false, version: 1 };
+  return S.queue;
+}
+
+function queueAppend(newItems) {
+  const q = ensureQueue();
+  const have = new Set(q.items.map(i => i.video_id));
+  const fresh = newItems.filter(i => i.video_id && !have.has(i.video_id));
+  const base = q.items.length;
+  q.items.push(...fresh);
+  fresh.forEach((_, i) => q.order.push(base + i));
+  q.version++;
+  console.log(`[queue] +${fresh.length} queued (${q.order.length} total)`);
+  return { added: fresh.length, queue: q };
 }
 
 function nextPos(dir) {
@@ -441,8 +465,8 @@ async function startQueue(playlistId, startIndex = 0, opts = {}) {
   if (shuffle) {                       // start on the track that was asked for
     order = [startIndex, ...order.filter(i => i !== startIndex)];
   }
-  S.queue = { playlistId, name: pl.name, order, pos: shuffle ? 0 : startIndex,
-              repeat: opts.repeat || 'off', shuffle };
+  S.queue = { playlistId, name: pl.name, items: pl.items.map(i => ({ ...i })), order,
+              pos: shuffle ? 0 : startIndex, repeat: opts.repeat || 'off', shuffle, version: 1 };
   if (!S.client || !S.device) throw new Error('no device connected');
   await playQueuePos(S.queue.pos);
   return S.queue;
@@ -554,7 +578,9 @@ app.get('/api/status', async (req, res) => {
       duration: (st && st.media && st.media.duration) || (S.media && S.media.duration) || null,
       volume: vol == null ? null : +vol.toFixed(2), muted, rebuffers: S.rebuffers,
       media: S.media, auto_refreshes: S.refreshes,
-      queue: S.queue ? { ...S.queue, total: S.queue.order.length,
+      queue: S.queue ? { playlistId: S.queue.playlistId, name: S.queue.name,
+        pos: S.queue.pos, total: S.queue.order.length, version: S.queue.version,
+        repeat: S.queue.repeat, shuffle: S.queue.shuffle,
         item: queueItems()[S.queue.order[S.queue.pos]] || null,
         can_next: nextPos(1) >= 0, can_prev: nextPos(-1) >= 0 } : null,
       expires_in: S.expire ? Math.round(S.expire - Date.now() / 1000) : null });
@@ -649,6 +675,56 @@ function skip(dir, res) {
 }
 app.post('/api/queue/next', (req, res) => skip(1, res));
 app.post('/api/queue/prev', (req, res) => skip(-1, res));
+/* full queue contents - fetched only when the version changes */
+app.get('/api/queue', (req, res) => res.json(S.queue ? {
+  ...S.queue, items: S.queue.order.map(i => S.queue.items[i]).filter(Boolean),
+} : { empty: true }));
+
+/* append to what is playing: a video url, a playlist url, or a saved playlist */
+app.post('/api/queue/add', asyncRoute(async (req, res) => {
+  const { url, playlistId } = req.body || {};
+  if (playlistId) {
+    const pl = PL.get(playlistId);
+    if (!pl) return res.status(404).json({ error: 'no such playlist' });
+    const r = queueAppend(pl.items.map(i => ({ ...i })));
+    return res.json({ ok: true, added: r.added, total: r.queue.order.length });
+  }
+  if (!url) return res.status(400).json({ error: 'no url' });
+  const vid = videoIdOf(url);
+  if (vid && !isPlaylistUrl(url)) {           // fast path, same as adding to a playlist
+    let title = vid;
+    try { const o = await oembed(vid); title = o.title || vid; } catch (e) { logErr('oembed: ' + e.message); }
+    const item = { video_id: vid, title, duration: null,
+      url: 'https://www.youtube.com/watch?v=' + vid,
+      thumb: `https://i.ytimg.com/vi/${vid}/mqdefault.jpg` };
+    const r = queueAppend([item]);
+    res.json({ ok: true, added: r.added, total: r.queue.order.length, title });
+    ytdlp(['-4', '--no-warnings', '--no-playlist', '-J', '--flat-playlist', item.url])
+      .then(o => { const d = JSON.parse(o).duration;
+        const it = (S.queue && S.queue.items.find(x => x.video_id === vid));
+        if (it && d) { it.duration = d; S.queue.version++; } })
+      .catch(e => logErr('queue duration: ' + e.message));
+    return;
+  }
+  const items = await resolveItems(url);
+  if (!items.length) return res.status(400).json({ error: 'nothing found at that url' });
+  const r = queueAppend(items);
+  res.json({ ok: true, added: r.added, total: r.queue.order.length });
+}));
+
+/* jump to a position within the live queue */
+app.post('/api/queue/goto', (req, res) => {
+  if (!S.queue) return res.status(400).json({ error: 'nothing queued' });
+  const pos = parseInt((req.body || {}).pos, 10);
+  if (!(pos >= 0 && pos < S.queue.order.length)) return res.status(400).json({ error: 'bad position' });
+  const index = S.queue.order[pos];
+  const item = queueItems()[index] || null;
+  S.queue.pos = pos;
+  const token = ++advanceToken;
+  res.json({ ok: true, pos, index, total: S.queue.order.length, item });
+  playQueuePos(pos, token).catch(e => logErr('goto: ' + e.message));
+});
+
 app.post('/api/queue/stop', (req, res) => { S.queue = null; res.json({ ok: true }); });
 
 app.post('/api/queue/mode', (req, res) => {
@@ -661,7 +737,7 @@ app.post('/api/queue/mode', (req, res) => {
     S.queue.order = shuffle ? [cur, ...shuffled(n).filter(i => i !== cur)]
                             : [...Array(n).keys()];
     S.queue.pos = shuffle ? 0 : cur;
-    S.queue.shuffle = shuffle;
+    S.queue.shuffle = shuffle; S.queue.version++;
   }
   res.json({ ok: true, queue: S.queue });
 });

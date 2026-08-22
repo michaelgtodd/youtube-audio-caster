@@ -146,6 +146,7 @@ button.mini.done{background:var(--ok)}
              value="">
       <select id="device"></select>
       <button id="go">Cast</button>
+      <button class="ghost" id="queueadd" title="Append to what is playing instead of replacing it">＋ Queue</button>
       <button class="ghost" id="rescan" title="Re-scan for devices" aria-label="Re-scan for devices"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg></button>
     </div>
     <div id="msg"></div>
@@ -222,6 +223,7 @@ button.mini.done{background:var(--ok)}
       <input type="text" id="pladd" placeholder="Paste a video or playlist link to add…">
       <button class="ghost mini" id="pladdbtn">Add</button>
       <button class="mini" id="plplay">▶ Play all</button>
+      <button class="ghost mini" id="plqueue" title="Append this playlist to the live queue">＋ Queue all</button>
     </div>
     <div id="plmsg"></div>
     <div id="plitems"></div>
@@ -491,7 +493,7 @@ window.addEventListener('keydown', e=>{
 });
 
 /* ---------------- playlists ---------------- */
-let PLS=[], CURPL=null, NOWIDX=-1, DRAGFROM=null;
+let PLS=[], CURPL=null, DRAGFROM=null;
 const plmsg=(t,c)=>{ $('plmsg').innerHTML = t? `<div class="msg ${c||''}">${t}</div>`:''; };
 
 async function loadPlaylists(keepId){
@@ -514,11 +516,12 @@ function renderItems(){
   if(!CURPL){ box.innerHTML=''; $('plcount').textContent=''; return; }
   $('plcount').textContent = CURPL.items.length+' item'+(CURPL.items.length===1?'':'s');
   box.innerHTML = CURPL.items.map((it,i)=>`
-    <div class="pli${i===NOWIDX?' now':''}" draggable="true" data-idx="${i}">
+    <div class="pli" draggable="true" data-idx="${i}">
       <span class="pli-n">${i+1}</span>
       <img class="pli-thumb" src="${esc(it.thumb||'')}" alt="" onerror="this.style.visibility='hidden'">
       <span class="pli-t" title="${esc(it.title)}">${esc(it.title)}</span>
       <span class="pli-d">${it.duration?fmt(it.duration):'·'}</span>
+      <button class="pli-b" data-a="queue" title="Add to queue">＋</button>
       <button class="pli-b play" data-a="play" title="Play from here">▶</button>
       <button class="pli-b del" data-a="del" title="Remove">✕</button>
     </div>`).join('');
@@ -530,6 +533,13 @@ $('plitems').addEventListener('click', async e=>{
   if(act==='del'){
     try{ const j=await api(`/api/playlists/${CURPL.id}/item/${idx}`,{method:'DELETE'});
       CURPL=j.playlist; renderItems(); }catch(err){ plmsg(err.message,'err'); }
+  } else if(act==='queue'){
+    const it=CURPL.items[idx]; if(!it) return;
+    try{ const j=await api('/api/queue/add',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({url:it.url})});
+      plmsg(`queued "${it.title.slice(0,34)}" (${j.total} in queue)`,'ok');
+      setTimeout(()=>plmsg(''),2500);
+    }catch(err){ plmsg(err.message,'err'); }
   } else { playFrom(idx); }
 });
 
@@ -546,7 +556,7 @@ async function playFrom(idx){
   }catch(e){ plmsg(e.message,'err'); }
 }
 
-$('plsel').onchange=()=>{ CURPL=PLS.find(p=>p.id===$('plsel').value)||null; NOWIDX=-1; renderItems(); };
+$('plsel').onchange=()=>{ CURPL=PLS.find(p=>p.id===$('plsel').value)||null; renderItems(); };
 /* Electron defines window.prompt but calling it throws "prompt() is not
    supported", so the New and Rename buttons silently did nothing. Inline
    editor instead - no dialogs anywhere in this UI. */
@@ -661,30 +671,32 @@ $('plitems').addEventListener('drop',async e=>{
 /* The server answers with the target track immediately and loads it on the
    speaker afterwards, so the UI can show the change at once instead of waiting
    several seconds for the next status poll. */
-let SKIPHOLD=0;
+let SKIPHOLD=0, SKIPVID=null;
 async function skip(dir){
   const btn = dir>0 ? $('next') : $('prev');
   btn.disabled=true;
   try{
     const j=await api('/api/queue/'+(dir>0?'next':'prev'),{method:'POST'});
     if(j.ended){ tmsg('end of playlist','ok'); setTimeout(()=>tmsg(''),2500); }
-    else if(j.item){
-      SKIPHOLD=Date.now()+15000;
-      $('title').textContent=j.item.title||'';
-      $('state').textContent='LOADING'; $('dot').className='dot buf';
-      $('tcur').textContent='0:00';
-      $('tdur').textContent=j.item.duration?fmt(j.item.duration):'0:00';
-      DUR=j.item.duration||0; paintBar(0);
-      $('recv').textContent=`${j.pos+1}/${j.total}`;
-      if(typeof j.index==='number' && j.index!==NOWIDX){ NOWIDX=j.index; renderItems(); }
-      /* Mounting the new video now would leave it running against a speaker
-         still on the old track. Hold a spinner until the speaker catches up. */
-      WAITVID=j.item.video_id||null;
-      if($('showvid').checked) showLoading(true);
-      updateLink(WAITVID,0);
-    }
+    else if(j.item){ applySkipView(j); }
   }catch(e){ tmsg(e.message,'err'); setTimeout(()=>tmsg(''),3000); }
   btn.disabled=false;
+}
+
+function applySkipView(j){
+  SKIPHOLD=Date.now()+15000; SKIPVID=j.item.video_id||null;
+  $('title').textContent=j.item.title||'';
+  $('state').textContent='LOADING'; $('dot').className='dot buf';
+  $('tcur').textContent='0:00';
+  $('tdur').textContent=j.item.duration?fmt(j.item.duration):'0:00';
+  DUR=j.item.duration||0; paintBar(0);
+  $('recv').textContent=`${j.pos+1}/${j.total}`;
+      /* Mounting the new video now would leave it running against a speaker
+         still on the old track. Hold a spinner until the speaker catches up. */
+  WAITVID=j.item.video_id||null;
+  if($('showvid').checked) showLoading(true);
+  updateLink(WAITVID,0);
+  if(typeof j.pos==='number') highlightQueue(j.pos, j.total);
 }
 $('prev').onclick=()=>skip(-1);
 $('next').onclick=()=>skip(1);
@@ -711,40 +723,62 @@ $('repeat').onclick=async()=>{
 
 /* The "up next" panel mirrors the live queue. The playlist behind it is fetched
    once per queue rather than shipped on every status poll. */
-let QPL=null;
+let QV=-1, QITEMS=[];
+/* Highlight moves on its own so a skip shows in the sidebar instantly, without
+   waiting for the status poll that is deliberately held during a skip. */
+function highlightQueue(pos,total){
+  $('qitems').querySelectorAll('.qi').forEach(el=>{
+    const on=(+el.dataset.qpos===pos);
+    el.classList.toggle('now',on);
+    if(on) el.scrollIntoView({block:'nearest'});
+  });
+  if(total!=null) $('qmeta').textContent=`${pos+1} / ${total}`;
+}
 async function renderQueue(q){
-  if(!q){ $('qitems').innerHTML=''; $('qmeta').textContent='';
+  if(!q){ QV=-1; QITEMS=[]; $('qitems').innerHTML=''; $('qmeta').textContent='';
           $('qempty').style.display=''; return; }
-  if(!QPL || QPL.id!==q.playlistId){
-    try{ QPL=(await api('/api/playlists')).playlists.find(p=>p.id===q.playlistId)||null; }
-    catch(e){ return; }
+  if(q.version!==QV){
+    try{ const j=await api('/api/queue');
+      if(j && j.items){ QITEMS=j.items; QV=q.version;
+        $('qitems').innerHTML=QITEMS.map((it,n)=>`<div class="qi" data-qpos="${n}">
+          <span class="qi-n">${n+1}</span>
+          <img class="qi-th" src="${esc(it.thumb||'')}" alt="" onerror="this.style.visibility='hidden'">
+          <span class="qi-t" title="${esc(it.title)}">${esc(it.title)}</span>
+          <span class="qi-d">${it.duration?fmt(it.duration):'·'}</span></div>`).join('');
+      }
+    }catch(e){ return; }
   }
-  if(!QPL) return;
   $('qempty').style.display='none';
-  $('qmeta').textContent=`${q.pos+1} / ${q.total}`;
-  const rows=q.order.map((itemIdx,n)=>{
-    const it=QPL.items[itemIdx]; if(!it) return '';
-    return `<div class="qi${n===q.pos?' now':''}" data-qpos="${n}">
-      <span class="qi-n">${n+1}</span>
-      <img class="qi-th" src="${esc(it.thumb||'')}" alt="" onerror="this.style.visibility='hidden'">
-      <span class="qi-t" title="${esc(it.title)}">${esc(it.title)}</span>
-      <span class="qi-d">${it.duration?fmt(it.duration):'·'}</span>
-    </div>`;
-  }).join('');
-  if(rows!==$('qitems').innerHTML){
-    $('qitems').innerHTML=rows;
-    const cur=$('qitems').querySelector('.qi.now');
-    if(cur) cur.scrollIntoView({block:'nearest'});
-  }
+  highlightQueue(q.pos,q.total);
 }
 $('qitems').addEventListener('click', async e=>{
-  const row=e.target.closest('.qi'); if(!row||!QPL) return;
-  const qpos=+row.dataset.qpos;
-  try{ await api(`/api/playlists/${QPL.id}/play`,{method:'POST'.toString(),
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({index:qpos, shuffle:false, repeat:$('repeat').dataset.mode||'off'})});
-  }catch(err){ tmsg(err.message,'err'); }
+  const row=e.target.closest('.qi'); if(!row) return;
+  const pos=+row.dataset.qpos;
+  highlightQueue(pos);                    // optimistic
+  try{
+    const j=await api('/api/queue/goto',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({pos})});
+    if(j.item) applySkipView(j);
+  }catch(err){ tmsg(err.message,'err'); setTimeout(()=>tmsg(''),3000); }
 });
+
+async function queueAdd(body,where){
+  try{
+    const j=await api('/api/queue/add',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    where(`queued ${j.added} — ${j.total} in queue`,'ok');
+  }catch(e){ where(e.message,'err'); }
+}
+$('queueadd').onclick=async()=>{
+  const url=$('url').value.trim(); if(!url) return msg('paste a link first','err');
+  $('queueadd').disabled=true; msg('adding to queue…');
+  await queueAdd({url}, (t,c)=>{ msg(t,c); setTimeout(()=>msg(''),2500); });
+  $('url').value=''; $('queueadd').disabled=false;
+};
+$('plqueue').onclick=async()=>{
+  if(!CURPL) return plmsg('pick a playlist first','err');
+  await queueAdd({playlistId:CURPL.id},(t,c)=>{ plmsg(t,c); setTimeout(()=>plmsg(''),2500); });
+};
 
 async function tick(){
   try{
@@ -758,13 +792,10 @@ async function tick(){
       if(s.media&&s.media.title) $('title').textContent=s.media.title;
       const pos=s.position||0, dur=s.duration||0;
       if(SKIPHOLD && Date.now()<SKIPHOLD){
-        // a skip is in flight: only let the poll through once the speaker has
-        // actually moved to the new track
-        if(!(s.media && NOWIDX>=0 && CURPL && CURPL.items[NOWIDX]
-             && s.media.video_id===CURPL.items[NOWIDX].video_id)){
-          setTimeout(tick,1000); return;
-        }
-        SKIPHOLD=0;
+        // a skip is in flight: hold the optimistic view until the speaker is
+        // actually on the track we asked for
+        if(!(s.media && SKIPVID && s.media.video_id===SKIPVID)){ setTimeout(tick,1000); return; }
+        SKIPHOLD=0; SKIPVID=null;
       }
       DUR=dur;
       bar().classList.toggle('disabled', !dur);
@@ -795,12 +826,10 @@ async function tick(){
         }
       }
       if(q){
-        const idx=q.order[q.pos];
-        if(CURPL && CURPL.id===q.playlistId && idx!==NOWIDX){ NOWIDX=idx; renderItems(); }
         $('recv').textContent=`${q.pos+1}/${q.total} · ${q.name}`.slice(0,30);
         if($('shuffle').classList.contains('on')!==q.shuffle) $('shuffle').classList.toggle('on',q.shuffle);
         if(($('repeat').dataset.mode||'off')!==q.repeat) paintRepeat(q.repeat);
-      } else if(NOWIDX!==-1){ NOWIDX=-1; renderItems(); }
+      }
       if(s.media&&s.media.video_id&&$('showvid').checked) mountVideo(s.media.video_id);
       else if(s.media&&!s.media.video_id&&s.media.identified&&s.media.identified.confidence==='none')
         $('noplayer').textContent="Couldn't identify this stream, so there's no video to show. "
