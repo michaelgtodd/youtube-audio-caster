@@ -141,18 +141,21 @@ function startDiscovery() {
   console.log('[discovery] persistent mDNS browser started');
 }
 
-/* wait until the device set stops growing, or we hit the ceiling */
-async function discover(ms = 9000) {
+/* Wait until the device set stops growing. If `want` is given, do not settle
+   until that device has answered - devices reply at their own pace, and
+   returning a partial list means the caller silently misses a speaker. */
+async function discover(ms = 9000, want = null) {
   startDiscovery();
   try { browserInst.update(); } catch {}
   const deadline = Date.now() + ms;
-  const floor = Date.now() + 3500;      // never settle on a barely-populated list
+  const floor = Date.now() + 3500;
   let last = -1, stable = 0;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 700));
-    if (DEV.size === last) { if (++stable >= 5 && DEV.size > 0 && Date.now() > floor) break; }
-    else { stable = 0; last = DEV.size; }
+    const settled = DEV.size === last ? ++stable >= 5 : (stable = 0, last = DEV.size, false);
+    if (settled && DEV.size > 0 && Date.now() > floor && (!want || DEV.has(want))) break;
   }
+  if (want && !DEV.has(want)) console.log(`[discovery] ${want} did not answer in ${ms}ms`);
   return deviceList();
 }
 
@@ -427,10 +430,10 @@ app.use(express.static(path.join(__dirname, 'renderer')));
 
 app.get('/api/devices', async (req, res) => {
   try {
-    if (req.query.refresh === '1') await discover(9000);
-    else if (!DEV.size) await discover(9000);
-    res.json({ devices: deviceList(), connected: S.device,
-               preferred: loadSettings().lastDevice || null });
+    const want = loadSettings().lastDevice || null;
+    if (req.query.refresh === '1') await discover(9000, want);
+    else if (!DEV.size || (want && !DEV.has(want))) await discover(12000, want);
+    res.json({ devices: deviceList(), connected: S.device, preferred: want });
   } catch (e) { logErr(e); res.status(500).json({ error: String(e) }); }
 });
 

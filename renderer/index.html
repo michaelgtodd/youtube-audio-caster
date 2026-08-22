@@ -130,9 +130,13 @@ button.mini.done{background:var(--ok)}
     <div class="time"><span id="tcur">0:00</span><span id="tdur">0:00</span></div>
 
     <div class="row" style="margin-top:12px">
+      <button class="ghost" id="prev" title="Previous track">⏮</button>
       <button class="ghost" id="play">▶︎ Play</button>
       <button class="ghost" id="pause">❚❚ Pause</button>
+      <button class="ghost" id="next" title="Next track">⏭</button>
       <button class="ghost" id="stop">■ Stop</button>
+      <button class="ghost tog" id="shuffle" title="Shuffle">⤨</button>
+      <button class="ghost tog" id="repeat" title="Repeat: off">↻</button>
       <button class="ghost" id="refresh" title="Re-issue an expired CDN url and resume">↻ Refresh stream</button>
       <label class="sm" style="margin-left:auto">vol
         <input type="range" id="vol" min="0" max="100" value="80" style="width:110px">
@@ -250,6 +254,10 @@ async function loadDevices(refresh){
        whatever happened to sort first grabs an arbitrary speaker - and if that
        one is idle, it looks exactly like "nothing is playing". */
     if(have) attach();
+    else if(pref){                       // remembered device has not answered yet
+      msg('looking for '+pref+'…');
+      setTimeout(()=>loadDevices(true), 6000);
+    }
     else { msg('pick a speaker to connect','ok');
            $('noplayer').textContent='Choose a speaker above, then cast a link.'; }
   }catch(e){ $('device').innerHTML='<option value="">scan failed</option>'; msg(e.message,'err'); }
