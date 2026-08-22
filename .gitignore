@@ -1,0 +1,11 @@
+node_modules/
+dist/
+build/
+
+# yt-dlp binary is fetched by scripts/fetch-ytdlp.sh (~36MB, goes stale fast)
+bin/
+
+*.log
+sessions.json
+sessions.json.tmp
+.DS_Store
