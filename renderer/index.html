@@ -59,6 +59,24 @@ button:disabled{opacity:.45;cursor:default}
 .meta{font-size:12.5px;color:var(--muted);margin-top:10px;word-break:break-word}
 label.sm{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
 .aud{font-size:11px;background:var(--chip);border-radius:5px;padding:1px 6px;color:var(--muted)}
+#plitems{margin-top:12px;max-height:340px;overflow-y:auto;border-radius:9px}
+#plitems:empty{display:none}
+.pli{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:8px;cursor:pointer}
+.pli:hover{background:var(--chip)}
+.pli.now{background:color-mix(in srgb,var(--accent) 16%,transparent)}
+.pli.now .pli-t{color:var(--accent);font-weight:600}
+.pli.dragover{outline:2px dashed var(--accent);outline-offset:-2px}
+.pli-n{width:22px;text-align:right;font-size:11.5px;color:var(--muted);
+  font-variant-numeric:tabular-nums;flex:none}
+.pli-thumb{width:56px;height:32px;object-fit:cover;border-radius:4px;background:var(--chip);flex:none}
+.pli-t{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pli-d{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums;flex:none}
+.pli-b{background:none;color:var(--muted);border:0;padding:3px 6px;font-size:13px;
+  cursor:pointer;border-radius:5px;flex:none;opacity:0}
+.pli:hover .pli-b{opacity:1}
+.pli-b:hover{background:var(--bg);color:var(--ink)}
+.tog{background:var(--chip);color:var(--muted)}
+.tog.on{background:var(--accent);color:#fff}
 #linkrow{display:none;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}
 #expand{margin-left:auto}
 #exitexpand{display:none;position:fixed;top:12px;right:14px;z-index:70}
@@ -136,6 +154,23 @@ button.mini.done{background:var(--ok)}
       <button class="ghost mini" id="copylink">Copy</button>
       <label class="sm"><input type="checkbox" id="attime"> at current time</label>
     </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <select id="plsel" style="min-width:190px"></select>
+      <button class="ghost mini" id="plnew">+ New</button>
+      <button class="ghost mini" id="plrename">Rename</button>
+      <button class="ghost mini" id="pldel">Delete</button>
+      <span class="meta" id="plcount" style="margin-left:auto"></span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input type="text" id="pladd" placeholder="Paste a video or playlist link to add…">
+      <button class="ghost mini" id="pladdbtn">Add</button>
+      <button class="mini" id="plplay">▶ Play all</button>
+    </div>
+    <div id="plmsg"></div>
+    <div id="plitems"></div>
   </div>
 </div>
 
@@ -369,6 +404,138 @@ window.addEventListener('keydown', e=>{
   if(e.key==='Escape' && document.body.classList.contains('theater')){ setTheater(false); }
 });
 
+/* ---------------- playlists ---------------- */
+let PLS=[], CURPL=null, NOWIDX=-1, DRAGFROM=null;
+const plmsg=(t,c)=>{ $('plmsg').innerHTML = t? `<div class="msg ${c||''}">${t}</div>`:''; };
+
+async function loadPlaylists(keepId){
+  try{
+    const j=await api('/api/playlists');
+    PLS=j.playlists||[];
+    const want = keepId || (CURPL && CURPL.id) || (PLS[0]&&PLS[0].id);
+    $('plsel').innerHTML = PLS.length
+      ? PLS.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')
+      : '<option value="">no playlists yet</option>';
+    if(want && PLS.some(p=>p.id===want)) $('plsel').value=want;
+    CURPL = PLS.find(p=>p.id===$('plsel').value) || null;
+    renderItems();
+  }catch(e){ plmsg(e.message,'err'); }
+}
+const esc=t=>String(t==null?'':t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function renderItems(){
+  const box=$('plitems');
+  if(!CURPL){ box.innerHTML=''; $('plcount').textContent=''; return; }
+  $('plcount').textContent = CURPL.items.length+' item'+(CURPL.items.length===1?'':'s');
+  box.innerHTML = CURPL.items.map((it,i)=>`
+    <div class="pli${i===NOWIDX?' now':''}" draggable="true" data-idx="${i}">
+      <span class="pli-n">${i+1}</span>
+      <img class="pli-thumb" src="${esc(it.thumb||'')}" alt="" onerror="this.style.visibility='hidden'">
+      <span class="pli-t" title="${esc(it.title)}">${esc(it.title)}</span>
+      <span class="pli-d">${it.duration?fmt(it.duration):''}</span>
+      <button class="pli-b play" data-a="play" title="Play from here">▶</button>
+      <button class="pli-b del" data-a="del" title="Remove">✕</button>
+    </div>`).join('');
+}
+
+$('plitems').addEventListener('click', async e=>{
+  const row=e.target.closest('.pli'); if(!row||!CURPL) return;
+  const idx=+row.dataset.idx, act=e.target.dataset.a;
+  if(act==='del'){
+    try{ const j=await api(`/api/playlists/${CURPL.id}/item/${idx}`,{method:'DELETE'});
+      CURPL=j.playlist; renderItems(); }catch(err){ plmsg(err.message,'err'); }
+  } else { playFrom(idx); }
+});
+
+async function playFrom(idx){
+  if(!CURPL) return;
+  const dev=$('device').value; if(!dev) return plmsg('pick a speaker first','err');
+  plmsg('starting…');
+  try{
+    await api(`/api/playlists/${CURPL.id}/play`,{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({index:idx, shuffle:$('shuffle').classList.contains('on'),
+                           repeat:$('repeat').dataset.mode||'off'})});
+    plmsg('');
+  }catch(e){ plmsg(e.message,'err'); }
+}
+
+$('plsel').onchange=()=>{ CURPL=PLS.find(p=>p.id===$('plsel').value)||null; NOWIDX=-1; renderItems(); };
+$('plnew').onclick=async()=>{
+  const name=prompt('Playlist name:','My playlist'); if(!name) return;
+  const j=await api('/api/playlists',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name})});
+  loadPlaylists(j.playlist.id);
+};
+$('plrename').onclick=async()=>{
+  if(!CURPL) return; const name=prompt('Rename playlist:',CURPL.name); if(!name) return;
+  await api(`/api/playlists/${CURPL.id}/rename`,{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  loadPlaylists(CURPL.id);
+};
+$('pldel').onclick=async()=>{
+  if(!CURPL) return;
+  if(!confirm(`Delete "${CURPL.name}"? This cannot be undone.`)) return;
+  await api(`/api/playlists/${CURPL.id}`,{method:'DELETE'});
+  CURPL=null; loadPlaylists();
+};
+$('pladdbtn').onclick=async()=>{
+  if(!CURPL) return plmsg('create a playlist first','err');
+  const url=$('pladd').value.trim(); if(!url) return;
+  $('pladdbtn').disabled=true; plmsg('resolving… (a full playlist link can take a moment)');
+  try{
+    const j=await api(`/api/playlists/${CURPL.id}/add`,{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+    CURPL=j.playlist; renderItems(); $('pladd').value='';
+    plmsg(`added ${j.added} item${j.added===1?'':'s'}`,'ok');
+    setTimeout(()=>plmsg(''),2500);
+  }catch(e){ plmsg(e.message,'err'); }
+  $('pladdbtn').disabled=false;
+};
+$('pladd').addEventListener('keydown',e=>{ if(e.key==='Enter') $('pladdbtn').click(); });
+$('plplay').onclick=()=>playFrom(0);
+
+/* drag to reorder */
+$('plitems').addEventListener('dragstart',e=>{ const r=e.target.closest('.pli'); if(!r)return;
+  DRAGFROM=+r.dataset.idx; e.dataTransfer.effectAllowed='move'; });
+$('plitems').addEventListener('dragover',e=>{ e.preventDefault();
+  const r=e.target.closest('.pli'); if(!r)return;
+  document.querySelectorAll('.pli.dragover').forEach(x=>x.classList.remove('dragover'));
+  r.classList.add('dragover'); });
+$('plitems').addEventListener('drop',async e=>{
+  e.preventDefault();
+  document.querySelectorAll('.pli.dragover').forEach(x=>x.classList.remove('dragover'));
+  const r=e.target.closest('.pli'); if(!r||DRAGFROM===null||!CURPL) return;
+  const to=+r.dataset.idx;
+  if(to===DRAGFROM){ DRAGFROM=null; return; }
+  try{ const j=await api(`/api/playlists/${CURPL.id}/move`,{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({from:DRAGFROM,to})});
+    CURPL=j.playlist; renderItems(); }catch(err){ plmsg(err.message,'err'); }
+  DRAGFROM=null;
+});
+
+/* transport */
+$('prev').onclick=()=>api('/api/queue/prev',{method:'POST'}).catch(e=>plmsg(e.message,'err'));
+$('next').onclick=()=>api('/api/queue/next',{method:'POST'}).catch(e=>plmsg(e.message,'err'));
+$('shuffle').onclick=async()=>{
+  const on=!$('shuffle').classList.contains('on');
+  $('shuffle').classList.toggle('on',on);
+  try{ await api('/api/queue/mode',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({shuffle:on})}); }catch(e){}
+};
+const RMODES=['off','all','one'], RLABEL={off:'↻',all:'↻ all',one:'↻ 1'};
+$('repeat').dataset.mode='off';
+$('repeat').onclick=async()=>{
+  const cur=$('repeat').dataset.mode||'off';
+  const nx=RMODES[(RMODES.indexOf(cur)+1)%3];
+  $('repeat').dataset.mode=nx;
+  $('repeat').textContent=RLABEL[nx];
+  $('repeat').title='Repeat: '+nx;
+  $('repeat').classList.toggle('on', nx!=='off');
+  try{ await api('/api/queue/mode',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({repeat:nx})}); }catch(e){}
+};
+
 async function tick(){
   try{
     const s=await api('/api/status');
@@ -397,6 +564,17 @@ async function tick(){
       if(typeof s.volume==='number' && document.activeElement!==$('vol'))
         $('vol').value=Math.round(s.volume*100);
       updateLink(s.media && s.media.video_id, pos);
+      const q=s.queue;
+      if(q){
+        const idx=q.order[q.pos];
+        if(CURPL && CURPL.id===q.playlistId && idx!==NOWIDX){ NOWIDX=idx; renderItems(); }
+        $('recv').textContent=`${q.pos+1}/${q.total} · ${q.name}`.slice(0,30);
+        if($('shuffle').classList.contains('on')!==q.shuffle) $('shuffle').classList.toggle('on',q.shuffle);
+        if(($('repeat').dataset.mode||'off')!==q.repeat){
+          $('repeat').dataset.mode=q.repeat; $('repeat').textContent=RLABEL[q.repeat];
+          $('repeat').classList.toggle('on', q.repeat!=='off');
+        }
+      } else if(NOWIDX!==-1){ NOWIDX=-1; renderItems(); }
       if(s.media&&s.media.video_id&&$('showvid').checked) mountVideo(s.media.video_id);
       else if(s.media&&!s.media.video_id&&s.media.identified&&s.media.identified.confidence==='none')
         $('noplayer').textContent="Couldn't identify this stream, so there's no video to show. "
@@ -414,6 +592,6 @@ async function tick(){
   }catch(e){}
   setTimeout(tick,1000);
 }
-loadDevices(false); tick();
+loadDevices(false); loadPlaylists(); tick();
 </script>
 </body></html>

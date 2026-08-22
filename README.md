@@ -88,6 +88,26 @@ the speaker is streaming on its own.
 
 ---
 
+## Playlists
+
+Build playlists of videos and play them in sequence, with shuffle and repeat.
+They are stored in the app's userData directory as `playlists.json` - personal to
+your machine, never committed.
+
+- paste a **video link** to add one track, or a **YouTube playlist link** to
+  import the whole thing in one go (tested at 183 items)
+- drag to reorder, click any track to start from there
+- shuffle keeps whatever is playing and reshuffles everything else
+- repeat cycles off -> all -> one
+- the next track's stream is resolved **while the current one is still playing**,
+  so advancing is just a `load()` - without that prefetch the gap between tracks
+  is around nine seconds of yt-dlp extraction
+
+End-of-track detection is event driven. Polling `getStatus()` does not work: once
+a track finishes the receiver stops returning a media status at all, so there is
+no `IDLE`/`FINISHED` to observe - the call simply yields null. The player does
+push a status message carrying `idleReason`, so that is what advances the queue.
+
 ## What it handles
 
 **Attaches to sessions it didn't start.** Cast allows one receiver app and one

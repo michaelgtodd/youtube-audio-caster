@@ -6,6 +6,10 @@ build/
 bin/
 
 *.log
+# personal data - lives in the app's userData dir, never in the repo
 sessions.json
 sessions.json.tmp
+playlists.json
+playlists.json.tmp
+settings.json
 .DS_Store
