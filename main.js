@@ -61,28 +61,59 @@ async function showWindow() {
   win.once('ready-to-show', () => win.show());
 }
 
+/* Left-click toggles. Note this hides rather than minimises: the dock is hidden,
+   so a minimised window would go to a dock that is not on screen. hide() looks
+   identical and the tray brings it straight back. If the window is up but buried
+   behind something else, raise it instead of hiding it. */
+function toggleWindow() {
+  if (win && !win.isDestroyed() && win.isVisible()) {
+    if (win.isFocused()) win.hide();
+    else { win.show(); win.focus(); }
+    return;
+  }
+  showWindow();
+}
+
+function nowPlaying() {
+  const S = require('./server.js').S;
+  return {
+    line: S.media && S.media.title
+      ? `${S.lastState === 'PLAYING' ? '▶' : '❚❚'}  ${S.media.title.slice(0, 40)}`
+      : 'Nothing playing',
+    device: S.device ? `on ${S.device}` : 'not connected',
+  };
+}
+
+/* Built fresh each time it is popped up, so it never shows stale track info. */
+function buildMenu() {
+  const np = nowPlaying();
+  return Menu.buildFromTemplate([
+    { label: np.line, enabled: false },
+    { label: np.device, enabled: false },
+    { type: 'separator' },
+    { label: 'Open Window', click: () => showWindow() },
+    { type: 'separator' },
+    { label: 'Quit (stops auto-refresh)', click: () => { app.isQuitting = true; app.quit(); } },
+  ]);
+}
+
 function buildTray() {
   const img = nativeImage.createFromPath(path.join(__dirname, 'assets', 'trayTemplate.png'));
   img.setTemplateImage(true);                       // adapts to light/dark menu bar
   tray = new Tray(img);
-  tray.setToolTip('YouTube Audio Caster');
-  const refresh = () => {
-    const S = require('./server.js').S;
-    const playing = S.media && S.media.title
-      ? `${S.lastState === 'PLAYING' ? '▶' : '❚❚'}  ${S.media.title.slice(0, 40)}`
-      : 'Nothing playing';
-    tray.setContextMenu(Menu.buildFromTemplate([
-      { label: playing, enabled: false },
-      { label: S.device ? `on ${S.device}` : 'not connected', enabled: false },
-      { type: 'separator' },
-      { label: 'Open Window', click: () => showWindow() },
-      { type: 'separator' },
-      { label: 'Quit (stops auto-refresh)', click: () => { app.isQuitting = true; app.quit(); } },
-    ]));
+
+  const updateTip = () => {
+    const np = nowPlaying();
+    tray.setToolTip(`YouTube Audio Caster\n${np.line}\n${np.device}`);
   };
-  refresh();
-  setInterval(refresh, 5000);
-  tray.on('click', () => showWindow());
+  updateTip();
+  setInterval(updateTip, 5000);
+
+  /* Deliberately NOT setContextMenu(): assigning a context menu makes a left
+     click open the menu and swallows the click event. Wiring the two buttons
+     separately gives left = open window, right = menu. */
+  tray.on('click', () => toggleWindow());
+  tray.on('right-click', () => tray.popUpContextMenu(buildMenu()));
 }
 
 app.whenReady().then(async () => {
