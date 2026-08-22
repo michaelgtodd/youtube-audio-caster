@@ -8,7 +8,8 @@
     "start": "electron .",
     "server": "node server.js",
     "postinstall": "sh scripts/fetch-ytdlp.sh",
-    "update-ytdlp": "sh scripts/fetch-ytdlp.sh"
+    "update-ytdlp": "sh scripts/fetch-ytdlp.sh",
+    "icon": "node scripts/make-icon.js"
   },
   "keywords": [],
   "author": "",

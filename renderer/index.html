@@ -95,10 +95,41 @@ label.sm{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6
   </div>
 </div>
 
-<script src="https://www.youtube.com/iframe_api"></script>
 <script>
 const $=id=>document.getElementById(id);
-let YT_PLAYER=null, YT_READY=false, CUR_VID=null, SYNCING=false;
+let YT_PLAYER=null, YT_READY=false, CUR_VID=null, SYNCING=false, PENDING_VID=null;
+
+/* send diagnostics to the server log so problems are visible without a debugger */
+function clog(msg){ try{ fetch('/api/clientlog',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({msg})}); }catch(e){} }
+window.addEventListener('error', e => clog('js error: '+e.message));
+
+/* The IFrame API is loaded programmatically and POLLED for readiness. Relying on
+   the onYouTubeIframeAPIReady callback alone is fragile: if the script is served
+   from cache or fails to load, the callback may never fire and the player would
+   silently never mount. */
+function loadYTApi(){
+  if(window.YT && window.YT.Player){ YT_READY=true; return; }
+  if(!document.getElementById('ytapi')){
+    const t=document.createElement('script');
+    t.id='ytapi'; t.src='https://www.youtube.com/iframe_api';
+    t.onerror=()=>clog('iframe_api FAILED to load');
+    document.head.appendChild(t);
+  }
+}
+window.onYouTubeIframeAPIReady=()=>{ YT_READY=true; clog('YT api ready (callback)');
+  if(PENDING_VID){const v=PENDING_VID; PENDING_VID=null; mountVideo(v);} };
+
+let ytWaited=0;
+setInterval(()=>{
+  if(YT_READY) return;
+  if(window.YT && window.YT.Player){ YT_READY=true; clog('YT api ready (poll)');
+    if(PENDING_VID){const v=PENDING_VID; PENDING_VID=null; mountVideo(v);} return; }
+  ytWaited+=500;
+  if(ytWaited===5000) clog('YT api still not ready after 5s - retrying load');
+  if(ytWaited%5000===0){ const old=document.getElementById('ytapi'); if(old) old.remove(); loadYTApi(); }
+}, 500);
+loadYTApi();
 
 function fmt(s){s=Math.max(0,Math.floor(s||0));const h=Math.floor(s/3600),
   m=Math.floor(s%3600/60),x=s%60;
@@ -106,18 +137,20 @@ function fmt(s){s=Math.max(0,Math.floor(s||0));const h=Math.floor(s/3600),
           : `${m}:${String(x).padStart(2,'0')}`;}
 function msg(t,cls){$('msg').innerHTML = t? `<div class="msg ${cls||''}">${t}</div>`:'';}
 
-let PENDING_VID=null;
-window.onYouTubeIframeAPIReady=()=>{YT_READY=true;if(PENDING_VID){const v=PENDING_VID;PENDING_VID=null;mountVideo(v);}};
-
 function mountVideo(vid){
   if(!vid) return;
-  if(!YT_READY){PENDING_VID=vid;return;}
+  if(!YT_READY){ PENDING_VID=vid; clog('mount deferred, api not ready: '+vid); return; }
+  if(vid===CUR_VID && YT_PLAYER) return;
   CUR_VID=vid;
   $('playerwrap').classList.remove('hide'); $('noplayer').classList.add('hide');
-  if(YT_PLAYER&&YT_PLAYER.loadVideoById){YT_PLAYER.loadVideoById(vid);YT_PLAYER.mute();return;}
-  YT_PLAYER=new YT.Player('player',{videoId:vid,
-    playerVars:{autoplay:1,controls:0,mute:1,rel:0,modestbranding:1,playsinline:1},
-    events:{onReady:e=>{e.target.mute();e.target.playVideo();}}});
+  clog('mounting '+vid);
+  try{
+    if(YT_PLAYER && YT_PLAYER.loadVideoById){ YT_PLAYER.loadVideoById(vid); YT_PLAYER.mute(); return; }
+    YT_PLAYER=new YT.Player('player',{videoId:vid,
+      playerVars:{autoplay:1,controls:0,mute:1,rel:0,modestbranding:1,playsinline:1},
+      events:{onReady:e=>{e.target.mute();e.target.playVideo();clog('player ready');},
+              onError:e=>clog('player error code '+e.data)}});
+  }catch(e){ clog('mount threw: '+e.message); CUR_VID=null; }
 }
 
 async function api(p,o){const r=await fetch(p,o);let j={};try{j=await r.json()}catch(e){}
@@ -131,8 +164,25 @@ async function loadDevices(refresh){
       `<option value="${d.name}">${d.name}${d.audio_only?' — speaker':''}</option>`).join('')
       || '<option value="">none found</option>';
     if(j.connected) $('device').value=j.connected;
-    attach();
   }catch(e){ $('device').innerHTML='<option value="">scan failed</option>'; msg(e.message,'err'); }
+  attach();
+}
+
+async function attach(){
+  const dev=$('device').value; if(!dev) return;
+  try{
+    const j=await api('/api/attach',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({device:dev})});
+    const vid = j.media && j.media.video_id;
+    clog('attach adopted='+j.adopted+' video_id='+vid);
+    if(vid){                       // identified: show it, whoever started it
+      msg('attached to the session playing on '+dev,'ok');
+      mountVideo(vid);
+    } else if(j.adopted){          // adopted but not yet identified - tick() may still mount
+      msg('attached to the session playing on '+dev,'ok');
+      $('noplayer').textContent='Working out what is playing…';
+    } else msg('');
+  }catch(e){ msg(e.message,'err'); }
 }
 
 $('go').onclick=async()=>{
@@ -151,18 +201,6 @@ $('go').onclick=async()=>{
 $('url').addEventListener('keydown',e=>{if(e.key==='Enter')$('go').click()});
 $('rescan').onclick=()=>loadDevices(true);
 $('device').onchange=()=>attach();
-async function attach(){
-  const dev=$('device').value; if(!dev) return;
-  try{
-    const j=await api('/api/attach',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({device:dev})});
-    if(j.adopted){ msg('attached to the session already playing on '+dev+
-      ' — casting a new link will replace it','ok');
-      $('noplayer').textContent='Attached to a stream this app didn\'t start, '+
-        'so there is no video to show. Cast a link here to get the synced video.'; }
-    else msg('');
-  }catch(e){ msg(e.message,'err'); }
-}
 for(const a of ['play','pause','stop','refresh'])
   $(a).onclick=()=>api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({action:a})}).catch(e=>msg(e.message,'err'));
@@ -175,7 +213,6 @@ $('showvid').onchange=e=>{
     if(YT_PLAYER&&YT_PLAYER.playVideo)YT_PLAYER.playVideo();}
 };
 
-// poll speaker; keep local video muted and synced to the speaker's clock
 async function tick(){
   try{
     const s=await api('/api/status');
@@ -191,9 +228,10 @@ async function tick(){
       $('prog').style.width = dur? (100*pos/dur).toFixed(2)+'%' : '0%';
       if(typeof s.volume==='number' && document.activeElement!==$('vol'))
         $('vol').value=Math.round(s.volume*100);
-      if(s.media&&s.media.video_id&&s.media.video_id!==CUR_VID&&$('showvid').checked)
-        mountVideo(s.media.video_id);
-      // drift correction
+      if(s.media&&s.media.video_id&&$('showvid').checked) mountVideo(s.media.video_id);
+      else if(s.media&&!s.media.video_id&&s.media.identified&&s.media.identified.confidence==='none')
+        $('noplayer').textContent="Couldn't identify this stream, so there's no video to show. "
+          +"Audio controls still work. Cast a link here to get the synced video.";
       if(YT_PLAYER&&YT_PLAYER.getCurrentTime&&$('showvid').checked&&!SYNCING){
         const local=YT_PLAYER.getCurrentTime()||0;
         if(s.state==='PLAYING'){

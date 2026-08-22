@@ -174,8 +174,18 @@ async function attach(name) {
   if (!live) return { adopted: false, app: (sessions || [])[0]?.displayName || null };
   const player = await p(client, 'join', live, DefaultMediaReceiver);
   S.player = player;
-  const st = await p(player, 'getStatus');
-  if (!st || !st.media) return { adopted: false, app: live.displayName };
+  // The first getStatus after join routinely comes back before the receiver has
+  // populated .media - poll briefly rather than concluding nothing is playing.
+  let st = null;
+  for (let i = 0; i < 8; i++) {
+    try { st = await p(player, 'getStatus'); } catch { st = null; }
+    if (st && st.media) break;
+    await new Promise(r => setTimeout(r, 400));
+  }
+  if (!st || !st.media) {
+    console.log('[attach] joined session but no media status after 3.2s');
+    return { adopted: false, app: live.displayName };
+  }
   const md = st.media;
   S.media = { title: (md.metadata && md.metadata.title) || '(already playing)',
     duration: md.duration, acodec: md.contentType, abr: null, ext: null,
@@ -314,6 +324,11 @@ app.post('/api/control', async (req, res) => {
     else return res.status(400).json({ error: 'unknown action ' + action });
     res.json({ ok: true });
   } catch (e) { logErr(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.post('/api/clientlog', (req, res) => {
+  console.log('[client]', String((req.body || {}).msg || '').slice(0, 200));
+  res.json({ ok: true });
 });
 
 app.get('/api/errors', (req, res) => res.json({ errors: S.errors.slice(-10) }));
