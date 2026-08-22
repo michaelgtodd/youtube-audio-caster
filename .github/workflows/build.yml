@@ -19,14 +19,9 @@ jobs:
           - os: macos-latest
             label: macOS
             script: dist:mac
-            artifacts: |
-              dist/*.dmg
-              dist/*.zip
           - os: windows-latest
             label: Windows
             script: dist:win
-            artifacts: |
-              dist/*.exe
 
     steps:
       # Each installer is built on its own OS. Cross-building Windows from macOS
@@ -57,12 +52,57 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
-          path: ${{ matrix.artifacts }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.exe
           if-no-files-found: error
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+  # One job publishes, after both builds are done. Having each build job attach
+  # its own files races two writers against the same release.
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
         with:
-          files: ${{ matrix.artifacts }}
+          fetch-depth: 0        # need the tag object to read its annotation
+          lfs: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect installers
+        run: |
+          mkdir -p out
+          find artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) \
+            -exec cp {} out/ \;
+          ls -lh out
+
+      - name: Build release notes from the tag annotation
+        run: |
+          git fetch --force --tags --quiet
+          # %(contents) is empty for a lightweight tag, so fall back to the subject
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > NOTES.md
+          if [ ! -s NOTES.md ]; then echo "Release $GITHUB_REF_NAME" > NOTES.md; fi
+          {
+            echo
+            echo '### Downloads'
+            echo '- **macOS** — `.dmg` (Apple Silicon and Intel builds are listed separately)'
+            echo '- **Windows** — `Setup.exe` to install, or the plain `.exe` to run without installing'
+            echo
+            echo 'Unsigned, so macOS asks you to right-click → Open and Windows SmartScreen needs More info → Run anyway.'
+          } >> NOTES.md
+          cat NOTES.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: NOTES.md
+          generate_release_notes: true         # appends the commit changelog
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: out/*
           fail_on_unmatched_files: true
