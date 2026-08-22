@@ -35,6 +35,20 @@ async function showWindow() {
   });
   win.loadURL(`http://127.0.0.1:${PORT}/`);
   win.webContents.setWindowOpenHandler(({ url }) => { shell.openExternal(url); return { action: 'deny' }; });
+
+  /* A dock-hidden app gets no application menu, so it gets no menu-driven
+     shortcuts either - fullscreen had no way out. Bind the keys directly. */
+  win.webContents.on('before-input-event', (e, input) => {
+    if (input.type !== 'keyDown') return;
+    const cmd = input.meta || input.control;
+    const key = (input.key || '').toLowerCase();
+    if (key === 'f11') { win.setFullScreen(!win.isFullScreen()); e.preventDefault(); }
+    else if (key === 'escape' && win.isFullScreen()) { win.setFullScreen(false); e.preventDefault(); }
+    else if (cmd && key === 'w') { win.close(); e.preventDefault(); }
+    else if (cmd && key === 'q') { app.isQuitting = true; app.quit(); e.preventDefault(); }
+    else if (cmd && key === 'r') { win.reload(); e.preventDefault(); }
+    else if (cmd && input.shift && key === 'i') { win.webContents.toggleDevTools(); e.preventDefault(); }
+  });
   win.on('closed', () => { win = null; });
   win.once('ready-to-show', () => win.show());
 }

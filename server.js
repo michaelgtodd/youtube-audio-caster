@@ -169,9 +169,21 @@ async function connectDevice(name) {
 async function attach(name) {
   const { client } = await connectDevice(name);
   S.media = null; S.srcUrl = null; S.expire = null;
-  const sessions = await p(client, 'getSessions');
-  const live = (sessions || []).find(s => s.appId === DMR_APP_ID);
-  if (!live) return { adopted: false, app: (sessions || [])[0]?.displayName || null };
+  // getSessions() straight after connect() can come back empty before the
+  // receiver status has populated - same race as getStatus() after join().
+  let sessions = [], live = null;
+  for (let i = 0; i < 8; i++) {
+    try { sessions = (await p(client, 'getSessions')) || []; } catch { sessions = []; }
+    live = sessions.find(x => x.appId === DMR_APP_ID);
+    if (live) break;
+    await new Promise(r => setTimeout(r, 400));
+  }
+  if (!live) {
+    console.log(`[attach] no ${DMR_APP_ID} session after 3.2s (saw ${sessions.length}: ` +
+                `${sessions.map(x => x.appId).join(',') || 'none'})`);
+    return { adopted: false, app: sessions[0]?.displayName || null };
+  }
+  console.log(`[attach] joined session ${live.sessionId.slice(0, 8)}`);
   const player = await p(client, 'join', live, DefaultMediaReceiver);
   S.player = player;
   // The first getStatus after join routinely comes back before the receiver has

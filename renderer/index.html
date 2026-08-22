@@ -16,7 +16,11 @@
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
   font:15px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",Segoe UI,sans-serif}
-.wrap{max-width:980px;margin:0 auto;padding:24px 20px 60px}
+.wrap{max-width:980px;margin:0 auto;padding:46px 20px 60px}
+/* titleBarStyle:hiddenInset removes the title bar, so the page must supply its
+   own drag region or the window cannot be moved at all. */
+#titlebar{position:fixed;top:0;left:0;right:0;height:38px;z-index:60;-webkit-app-region:drag}
+button,input,select,a,#playerwrap,.bar{-webkit-app-region:no-drag}
 h1{font-size:19px;margin:0 0 2px;letter-spacing:-.2px}
 .sub{color:var(--muted);font-size:13px;margin-bottom:20px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
@@ -60,6 +64,16 @@ button:disabled{opacity:.45;cursor:default}
 label.sm{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
 .aud{font-size:11px;background:var(--chip);border-radius:5px;padding:1px 6px;color:var(--muted)}
 #linkrow{display:none;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}
+#expand{margin-left:auto}
+#exitexpand{display:none;position:fixed;top:14px;right:16px;z-index:70;-webkit-app-region:no-drag}
+body.theater #titlebar{height:14px}
+body.theater .wrap{padding:0;max-width:none}
+body.theater .card:not(#playercard){display:none}
+body.theater #playercard{position:fixed;inset:0;margin:0;padding:0;border:0;border-radius:0;
+  background:#000;z-index:40;display:flex;align-items:center;justify-content:center}
+body.theater #playercard>*:not(#playerwrap){display:none}
+body.theater #playerwrap{width:100vw;height:100vh;aspect-ratio:auto;border-radius:0}
+body.theater #exitexpand{display:block}
 #ytlink{flex:1;min-width:200px;font-size:12.5px;color:var(--accent);text-decoration:none;
   background:var(--chip);border-radius:7px;padding:7px 10px;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
@@ -69,6 +83,8 @@ button.mini.done{background:var(--ok)}
 </style>
 </head>
 <body>
+<div id="titlebar"></div>
+<button class="ghost mini" id="exitexpand" title="Exit theater mode (Esc)">✕ Exit</button>
 <div class="wrap">
   <h1>YouTube Audio Caster</h1>
   <div class="sub">Native buffered audio to a Cast speaker &middot; video stays local &amp; synced</div>
@@ -79,7 +95,7 @@ button.mini.done{background:var(--ok)}
              value="">
       <select id="device"></select>
       <button id="go">Cast</button>
-      <button class="ghost" id="rescan" title="Re-scan for devices">⟳</button>
+      <button class="ghost" id="rescan" title="Re-scan for devices" aria-label="Re-scan for devices"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg></button>
     </div>
     <div id="msg"></div>
   </div>
@@ -104,6 +120,7 @@ button.mini.done{background:var(--ok)}
         <input type="range" id="vol" min="0" max="100" value="80" style="width:110px">
       </label>
       <label class="sm"><input type="checkbox" id="showvid" checked> show video</label>
+      <button class="ghost mini" id="expand" title="Fill the window (Esc to exit)">⤢ Theater</button>
     </div>
 
     <div class="grid">
@@ -173,7 +190,7 @@ function mountVideo(vid){
   try{
     if(YT_PLAYER && YT_PLAYER.loadVideoById){ YT_PLAYER.loadVideoById(vid); YT_PLAYER.mute(); return; }
     YT_PLAYER=new YT.Player('player',{videoId:vid,
-      playerVars:{autoplay:1,controls:0,mute:1,rel:0,modestbranding:1,playsinline:1},
+      playerVars:{autoplay:1,controls:1,mute:1,rel:0,modestbranding:1,playsinline:1,fs:1},
       events:{onReady:e=>{e.target.mute();e.target.playVideo();clog('player ready');},
               onError:e=>clog('player error code '+e.data)}});
   }catch(e){ clog('mount threw: '+e.message); CUR_VID=null; }
@@ -319,6 +336,17 @@ $('copylink').onclick=async()=>{
   setTimeout(()=>{ b.textContent='Copy'; b.classList.remove('done'); }, 1400);
 };
 clog('clipboard api available: '+(!!(navigator.clipboard&&navigator.clipboard.writeText)));
+
+function setTheater(on){
+  document.body.classList.toggle('theater', on);
+  if(on && !$('showvid').checked){ $('showvid').checked=true; $('showvid').dispatchEvent(new Event('change')); }
+}
+$('expand').onclick=()=>setTheater(!document.body.classList.contains('theater'));
+$('exitexpand').onclick=()=>setTheater(false);
+/* Esc backs out of theater mode here; main.js handles Esc for OS fullscreen. */
+window.addEventListener('keydown', e=>{
+  if(e.key==='Escape' && document.body.classList.contains('theater')){ setTheater(false); }
+});
 
 async function tick(){
   try{
