@@ -16,11 +16,7 @@
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
   font:15px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",Segoe UI,sans-serif}
-.wrap{max-width:980px;margin:0 auto;padding:46px 20px 60px}
-/* titleBarStyle:hiddenInset removes the title bar, so the page must supply its
-   own drag region or the window cannot be moved at all. */
-#titlebar{position:fixed;top:0;left:0;right:0;height:38px;z-index:60;-webkit-app-region:drag}
-button,input,select,a,#playerwrap,.bar{-webkit-app-region:no-drag}
+.wrap{max-width:980px;margin:0 auto;padding:24px 20px 60px}
 h1{font-size:19px;margin:0 0 2px;letter-spacing:-.2px}
 .sub{color:var(--muted);font-size:13px;margin-bottom:20px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
@@ -65,15 +61,18 @@ label.sm{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6
 .aud{font-size:11px;background:var(--chip);border-radius:5px;padding:1px 6px;color:var(--muted)}
 #linkrow{display:none;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}
 #expand{margin-left:auto}
-#exitexpand{display:none;position:fixed;top:14px;right:16px;z-index:70;-webkit-app-region:no-drag}
-body.theater #titlebar{height:14px}
-body.theater .wrap{padding:0;max-width:none}
+#exitexpand{display:none;position:fixed;top:12px;right:14px;z-index:70}
+body.theater{overflow:hidden}                 /* the scrollbar was eating the right edge */
+body.theater .wrap{padding:0;max-width:none;height:100vh;overflow:hidden}
 body.theater .card:not(#playercard){display:none}
 body.theater #playercard{position:fixed;inset:0;margin:0;padding:0;border:0;border-radius:0;
-  background:#000;z-index:40;display:flex;align-items:center;justify-content:center}
+  background:#000;z-index:40;overflow:hidden}
 body.theater #playercard>*:not(#playerwrap){display:none}
-body.theater #playerwrap{width:100vw;height:100vh;aspect-ratio:auto;border-radius:0}
-body.theater #exitexpand{display:block}
+body.theater #playerwrap{position:absolute;inset:0;width:100%;height:100%;
+  aspect-ratio:auto;border-radius:0}
+body.theater #playerwrap iframe{width:100%;height:100%}
+body.theater #exitexpand{display:block;opacity:.25;transition:opacity .15s}
+body.theater #exitexpand:hover{opacity:1}
 #playerwrap:fullscreen{width:100vw;height:100vh;aspect-ratio:auto;border-radius:0;background:#000}
 #playerwrap:fullscreen iframe{width:100%;height:100%}
 #ytlink{flex:1;min-width:200px;font-size:12.5px;color:var(--accent);text-decoration:none;
@@ -85,7 +84,6 @@ button.mini.done{background:var(--ok)}
 </style>
 </head>
 <body>
-<div id="titlebar"></div>
 <button class="ghost mini" id="exitexpand" title="Exit theater mode (Esc)">✕ Exit</button>
 <div class="wrap">
   <h1>YouTube Audio Caster</h1>

@@ -30,7 +30,9 @@ async function showWindow() {
   win = new BrowserWindow({
     width: 1000, height: 820, minWidth: 560, minHeight: 520,
     title: 'YouTube Audio Caster', backgroundColor: '#0f1113',
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    // a real title bar: traffic lights live in chrome, not floating over the page,
+    // and the window drags natively without the page supplying a drag region
+    titleBarStyle: 'default',
     webPreferences: { contextIsolation: true, nodeIntegration: false },
   });
   win.loadURL(`http://127.0.0.1:${PORT}/`);
