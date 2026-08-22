@@ -38,7 +38,8 @@ playing, so you can watch along.
 
 ## Getting it running
 
-You'll need [Node.js](https://nodejs.org) installed. Then, in a terminal:
+Works on **macOS and Windows**. You'll need [Node.js](https://nodejs.org) installed.
+Then, in a terminal (or PowerShell on Windows):
 
 ```
 git clone https://github.com/michaelgtodd/youtube-audio-caster
@@ -47,8 +48,31 @@ npm install
 npm start
 ```
 
-The app lives in your **menu bar** rather than the Dock. Click the speaker icon to
-show or hide the window; right-click it for a menu.
+**On macOS** the app lives in your menu bar rather than the Dock. Click the speaker
+icon to show or hide the window, right-click it for a menu.
+
+**On Windows** it behaves like a normal app with a taskbar button, and also puts an
+icon in the notification area. Closing the window tucks it away there rather than
+quitting, so your music keeps playing — it tells you the first time so it doesn't
+look like a crash. To actually exit, right-click the notification-area icon and
+choose Quit.
+
+### Ready-made installers
+
+Every tagged version is built automatically for both platforms — grab a `.dmg`
+(macOS) or `.exe` (Windows) from the
+[releases page](https://github.com/michaelgtodd/youtube-audio-caster/releases).
+
+### Building one yourself
+
+If you'd rather build it than download it:
+
+```
+npm run dist:win     # Windows installer + portable exe
+npm run dist:mac     # macOS .dmg
+```
+
+The result lands in `dist/`.
 
 ## Using it
 
@@ -80,8 +104,9 @@ screen with nothing else on it. Press Esc to come back from either.
 - Works with YouTube links only
 - If videos suddenly stop loading, YouTube has probably changed something — run
   `npm run update-ytdlp` and try again
-- The app isn't digitally signed yet, so the first time you open it macOS or
-  Windows may warn you; right-click and choose Open
+- The app isn't digitally signed yet, so the first time you open it macOS will warn
+  you (right-click and choose Open) and Windows SmartScreen will ask you to confirm
+  (More info → Run anyway)
 - Anyone on your network can reach it if you deliberately share it; by default it's
   only reachable from your own machine
 

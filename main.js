@@ -1,13 +1,26 @@
 'use strict';
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, Notification } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const net = require('net');
+
+const isMac = process.platform === 'darwin';
+const isWin = process.platform === 'win32';
+
+/* Two instances would race for the same speaker and start two servers. */
+if (!app.requestSingleInstanceLock()) { app.quit(); return; }
 
 process.env.CASTAUDIO_DATA = app.getPath('userData');
 const binDir = app.isPackaged ? path.join(process.resourcesPath, 'bin') : path.join(__dirname, 'bin');
 process.env.YTDLP = path.join(binDir, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 
 let win = null, tray = null, PORT = null, serverStarted = false;
+
+const flagFile = () => path.join(app.getPath('userData'), 'ui-flags.json');
+const flags = () => { try { return JSON.parse(fs.readFileSync(flagFile(), 'utf8')); } catch { return {}; } };
+const setFlag = (k, v) => { try { const f = flags(); f[k] = v;
+  fs.mkdirSync(app.getPath('userData'), { recursive: true });
+  fs.writeFileSync(flagFile(), JSON.stringify(f)); } catch {} };
 
 const freePort = () => new Promise(res => {
   const s = net.createServer();
@@ -30,9 +43,11 @@ async function showWindow() {
   win = new BrowserWindow({
     width: 1000, height: 820, minWidth: 560, minHeight: 520,
     title: 'YouTube Audio Caster', backgroundColor: '#0f1113',
+    icon: path.join(__dirname, 'assets', 'icon.png'),   // taskbar / alt-tab on Windows
     // a real title bar: traffic lights live in chrome, not floating over the page,
     // and the window drags natively without the page supplying a drag region
     titleBarStyle: 'default',
+    autoHideMenuBar: true,                              // no empty File/Edit strip on Windows
     webPreferences: { contextIsolation: true, nodeIntegration: false },
   });
   win.loadURL(`http://127.0.0.1:${PORT}/`);
@@ -56,6 +71,21 @@ async function showWindow() {
     else if (cmd && key === 'q') { app.isQuitting = true; app.quit(); e.preventDefault(); }
     else if (cmd && key === 'r') { win.reload(); e.preventDefault(); }
     else if (cmd && input.shift && key === 'i') { win.webContents.toggleDevTools(); e.preventDefault(); }
+  });
+  /* On Windows, closing the window normally quits the app - but this one has to
+     outlive its window so the CDN-refresh watchdog keeps running. Close hides to
+     the tray instead, and says so once so it does not look like a crash. */
+  win.on('close', e => {
+    if (app.isQuitting || !isWin) return;
+    e.preventDefault(); win.hide();
+    if (!flags().trayHintShown) {
+      setFlag('trayHintShown', true);
+      if (Notification.isSupported()) new Notification({
+        title: 'Still running',
+        body: 'YouTube Audio Caster is in the notification area. Playback and auto-refresh keep going. Quit from its icon there.',
+        icon: path.join(__dirname, 'assets', 'icon.png'),
+      }).show();
+    }
   });
   win.on('closed', () => { win = null; });
   win.once('ready-to-show', () => win.show());
@@ -98,8 +128,12 @@ function buildMenu() {
 }
 
 function buildTray() {
-  const img = nativeImage.createFromPath(path.join(__dirname, 'assets', 'trayTemplate.png'));
-  img.setTemplateImage(true);                       // adapts to light/dark menu bar
+  /* macOS inverts a template image to suit the menu bar. Windows does not, so a
+     black glyph would disappear on a dark taskbar - it gets a white one with a
+     dark halo instead, which reads on either theme. */
+  const iconFile = isMac ? 'trayTemplate.png' : 'tray-win.png';
+  const img = nativeImage.createFromPath(path.join(__dirname, 'assets', iconFile));
+  if (isMac) img.setTemplateImage(true);
   tray = new Tray(img);
 
   const updateTip = () => {
@@ -109,21 +143,33 @@ function buildTray() {
   updateTip();
   setInterval(updateTip, 5000);
 
-  /* Deliberately NOT setContextMenu(): assigning a context menu makes a left
-     click open the menu and swallows the click event. Wiring the two buttons
-     separately gives left = open window, right = menu. */
+  /* macOS: setContextMenu() would make a LEFT click open the menu and swallow the
+     click event, so the two buttons are wired separately.
+     Windows: a tray icon is expected to have a context menu attached; left click
+     still fires 'click' there, so both behaviours work with it assigned. */
   tray.on('click', () => toggleWindow());
-  tray.on('right-click', () => tray.popUpContextMenu(buildMenu()));
+  if (isWin) {
+    tray.setContextMenu(buildMenu());
+    setInterval(() => tray.setContextMenu(buildMenu()), 5000);
+  } else {
+    tray.on('right-click', () => tray.popUpContextMenu(buildMenu()));
+  }
 }
 
+app.on('second-instance', () => showWindow());
+
 app.whenReady().then(async () => {
-  // menu-bar app: no Dock icon, no Cmd-Tab entry. The tray is how you get back.
-  if (process.platform === 'darwin' && app.dock) app.dock.hide();
+  /* macOS: a menu-bar app with no Dock icon - the tray is how you get back.
+     Windows: keep the taskbar button, which is what people expect there; the
+     tray is an addition rather than the only way in. */
+  if (isMac && app.dock) app.dock.hide();
+  if (isWin) app.setAppUserModelId('com.michaelgtodd.youtube-audio-caster');
   await ensureServer();
   buildTray();
   await showWindow();
   app.on('activate', () => showWindow());
 });
 
+app.on('before-quit', () => { app.isQuitting = true; });
 // closing the window must NOT quit - the watchdog keeps CDN urls alive
-app.on('window-all-closed', () => { /* stay resident in the menu bar */ });
+app.on('window-all-closed', () => { /* stay resident in the tray / menu bar */ });

@@ -1,35 +1,53 @@
-/* Generate a macOS template menu-bar icon (black + alpha only) with no deps. */
+#!/usr/bin/env node
+/* Generate tray and app icons with no image dependencies.
+   macOS wants a template icon (black + alpha) which the OS inverts to match the
+   menu bar. Windows does no such thing, so a black icon would vanish against a
+   dark taskbar - it gets a white glyph with a dark halo, legible on both light
+   and dark themes. */
 const zlib = require('zlib'), fs = require('fs'), path = require('path');
-const W = 32, H = 32;
-const px = Buffer.alloc(W * H * 4, 0);
-const set = (x, y, a) => {
-  if (x < 0 || y < 0 || x >= W || y >= H) return;
-  const i = (y * W + x) * 4;
-  if (a > px[i + 3]) { px[i] = px[i + 1] = px[i + 2] = 0; px[i + 3] = a; }
-};
-// speaker body + cone
-for (let y = 12; y < 20; y++) for (let x = 5; x <= 10; x++) set(x, y, 255);
-for (let y = 6; y < 26; y++) {
-  const half = Math.round((Math.abs(y - 16) <= 10) ? 10 - Math.abs(y - 16) : -1);
-  if (half >= 0) for (let x = 10; x <= 10 + (10 - half); x++) set(x, y, 255);
+
+function canvas(W, H) {
+  const px = Buffer.alloc(W * H * 4, 0);
+  return {
+    W, H, px,
+    set(x, y, r, g, b, a) {
+      x = Math.round(x); y = Math.round(y);
+      if (x < 0 || y < 0 || x >= W || y >= H || a <= 0) return;
+      const i = (y * W + x) * 4;
+      if (a >= px[i + 3]) { px[i] = r; px[i + 1] = g; px[i + 2] = b; px[i + 3] = a; }
+    },
+  };
 }
-// two sound arcs
-for (const [r, th] of [[6, 1.6], [9.5, 1.6]]) {
-  for (let a = -0.85; a <= 0.85; a += 0.008) {
-    const cx = 15 + Math.cos(a) * r, cy = 16 + Math.sin(a) * r;
-    for (let dx = -th / 2; dx <= th / 2; dx += 0.4)
-      for (let dy = -th / 2; dy <= th / 2; dy += 0.4) set(Math.round(cx + dx), Math.round(cy + dy), 255);
+
+/* Speaker body + cone + two arcs, defined as membership tests in a 32x32 design
+   space rather than painted with a brush, so it stays crisp at any output size. */
+function inGlyph(x, y, grow) {
+  const body = x >= 5 - grow && x <= 10 + grow && y >= 12 - grow && y <= 20 + grow;
+  const t = (x - 10) / 7;                       // 0 at the apex, 1 at the mouth
+  const cone = t >= -grow / 7 && x <= 17 + grow && Math.abs(y - 16) <= t * 11 + grow;
+  const dx = x - 17, dy = y - 16;
+  const d = Math.hypot(dx, dy), ang = Math.atan2(dy, dx);
+  const arcs = Math.abs(ang) < 0.95 &&
+    (Math.abs(d - 6) <= 0.85 + grow || Math.abs(d - 9.5) <= 0.85 + grow);
+  return body || cone || arcs;
+}
+
+function glyph(c, s, col, grow = 0) {
+  const k = s / 32, [r, g, b, a] = col;
+  for (let py = 0; py < s; py++) for (let px = 0; px < s; px++)
+    if (inGlyph((px + 0.5) / k, (py + 0.5) / k, grow)) c.set(px, py, r, g, b, a);
+}
+
+function roundedRect(c, s, rad, col) {
+  const [r, g, b, a] = col;
+  for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+    const dx = Math.max(rad - x, x - (s - 1 - rad), 0);
+    const dy = Math.max(rad - y, y - (s - 1 - rad), 0);
+    if (dx * dx + dy * dy <= rad * rad) c.set(x, y, r, g, b, a);
   }
 }
-// PNG encode
-const raw = Buffer.alloc((W * 4 + 1) * H);
-for (let y = 0; y < H; y++) { raw[y * (W * 4 + 1)] = 0; px.copy(raw, y * (W * 4 + 1) + 1, y * W * 4, (y + 1) * W * 4); }
-const chunk = (type, data) => {
-  const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
-  const td = Buffer.concat([Buffer.from(type), data]);
-  const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td) >>> 0);
-  return Buffer.concat([len, td, crc]);
-};
+
+// ---- PNG encoding ----
 let TBL = null;
 function crc32(buf) {
   if (!TBL) { TBL = []; for (let n = 0; n < 256; n++) { let c = n;
@@ -38,12 +56,45 @@ function crc32(buf) {
   for (const b of buf) c = TBL[(c ^ b) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
-const ihdr = Buffer.alloc(13);
-ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(H, 4);
-ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
-const png = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-  chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
-const out = path.join(__dirname, '..', 'assets', 'trayTemplate@2x.png');
-fs.writeFileSync(out, png);
-fs.writeFileSync(out.replace('@2x', ''), png);
-console.log('wrote', out, png.length, 'bytes');
+function png(c) {
+  const raw = Buffer.alloc((c.W * 4 + 1) * c.H);
+  for (let y = 0; y < c.H; y++) {
+    raw[y * (c.W * 4 + 1)] = 0;
+    c.px.copy(raw, y * (c.W * 4 + 1) + 1, y * c.W * 4, (y + 1) * c.W * 4);
+  }
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type), data]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td) >>> 0);
+    return Buffer.concat([len, td, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(c.W, 0); ihdr.writeUInt32BE(c.H, 4);
+  ihdr[8] = 8; ihdr[9] = 6;
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
+
+const OUT = path.join(__dirname, '..', 'assets');
+fs.mkdirSync(OUT, { recursive: true });
+const write = (name, c) => { fs.writeFileSync(path.join(OUT, name), png(c)); console.log('  ' + name); };
+
+// macOS template: black + alpha, the OS inverts it for the menu bar
+for (const [name, size] of [['trayTemplate.png', 32], ['trayTemplate@2x.png', 32]]) {
+  const c = canvas(size, size); glyph(c, size, [0, 0, 0, 255]); write(name, c);
+}
+// Windows: white glyph over a soft dark halo so it reads on light AND dark taskbars
+{
+  const s = 32, c = canvas(s, s);
+  glyph(c, s, [0, 0, 0, 120], 1.1);          // halo first
+  glyph(c, s, [255, 255, 255, 255], 0);      // glyph on top
+  write('tray-win.png', c);
+}
+// app icon for the taskbar / window / installer
+{
+  const s = 512, c = canvas(s, s);
+  roundedRect(c, s, Math.round(s * 0.22), [47, 109, 246, 255]);
+  glyph(c, s, [255, 255, 255, 255], 0.3);
+  write('icon.png', c);
+}
+console.log('icons written');

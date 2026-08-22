@@ -1,0 +1,68 @@
+name: Build installers
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # a Windows failure should not hide a good Mac build
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS
+            script: dist:mac
+            artifacts: |
+              dist/*.dmg
+              dist/*.zip
+          - os: windows-latest
+            label: Windows
+            script: dist:win
+            artifacts: |
+              dist/*.exe
+
+    steps:
+      # Each installer is built on its own OS. Cross-building Windows from macOS
+      # needs wine and would also bundle the wrong yt-dlp binary.
+      - uses: actions/checkout@v4
+        with:
+          lfs: false            # screenshots are not needed to build, and cost LFS bandwidth
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # postinstall fetches yt-dlp for the runner; beforePack fetches for the
+      # build target. On a native runner those are the same thing.
+      - run: npm ci
+
+      - name: Build
+        run: npm run ${{ matrix.script }}
+        env:
+          # no signing certificates in CI - build unsigned rather than fail
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Show what was produced
+        shell: bash
+        run: ls -lh dist | grep -Ev '^total|\.blockmap' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifacts }}
+          fail_on_unmatched_files: true
