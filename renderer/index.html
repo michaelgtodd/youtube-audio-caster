@@ -281,6 +281,38 @@ function showLoading(on){
   else  { $('vidload').classList.add('hide'); }
 }
 
+function clearVideo(reason){
+  WAITVID=null; showLoading(false);
+  if(CUR_VID){
+    CUR_VID=null;
+    try{ if(YT_PLAYER&&YT_PLAYER.stopVideo) YT_PLAYER.stopVideo(); }catch(e){}
+  }
+  $('playerwrap').classList.add('hide');
+  $('noplayer').classList.remove('hide');
+  $('noplayer').textContent = reason;
+  updateLink(null,0);
+  $('title').textContent='';
+  DUR=0; paintBar(0); $('tcur').textContent='0:00'; $('tdur').textContent='0:00';
+  $('state').textContent='idle'; $('dot').className='dot';
+  $('recv').textContent='—'; $('codec').textContent='—';
+}
+
+/* Nothing ever un-mounted the player, so switching to an idle speaker left the
+   previous device's video happily playing. */
+function clearVideo(reason){
+  WAITVID=null; showLoading(false);
+  if(CUR_VID){ CUR_VID=null;
+    try{ if(YT_PLAYER&&YT_PLAYER.stopVideo) YT_PLAYER.stopVideo(); }catch(e){} }
+  $('playerwrap').classList.add('hide');
+  $('noplayer').classList.remove('hide');
+  $('noplayer').textContent=reason;
+  updateLink(null,0);
+  $('title').textContent=''; DUR=0; paintBar(0);
+  $('tcur').textContent='0:00'; $('tdur').textContent='0:00';
+  $('state').textContent='idle'; $('dot').className='dot';
+  $('recv').textContent='—'; $('codec').textContent='—';
+}
+
 function mountVideo(vid){
   if(!vid) return;
   if(!YT_READY){ PENDING_VID=vid; clog('mount deferred, api not ready: '+vid); return; }
@@ -302,8 +334,11 @@ function mountVideo(vid){
 async function api(p,o){const r=await fetch(p,o);let j={};try{j=await r.json()}catch(e){}
   if(!r.ok) throw new Error(j.error||('HTTP '+r.status)); return j;}
 
-const deviceOptions = ds => ds.map(d=>
-  `<option value="${esc(d.name)}">${esc(d.name)}${d.is_group?' — group':(d.audio_only?' — speaker':'')}</option>`).join('');
+const deviceOptions = ds => ds.map(d=>{
+  const kind = d.is_group ? 'group' : (d.audio_only ? 'speaker' : 'video');
+  const busy = d.busy ? ' ▸ ' + (d.status_text || 'playing').slice(0,28) : '';
+  return `<option value="${esc(d.name)}">${esc(d.name)} — ${kind}${esc(busy)}</option>`;
+}).join('');
 
 /* The window is hidden rather than destroyed when toggled from the tray, so the
    page can live for hours without reloading. Re-sync the device list on a timer
@@ -321,26 +356,26 @@ async function syncDevices(){
     }
   }catch(e){}
 }
-setInterval(syncDevices, 20000);
+let devSyncs=0;
+setInterval(()=>{ devSyncs++; syncDevices(); }, 20000);
+// the first minute is when a late-answering speaker is most likely to appear
+const earlySync=setInterval(()=>{ if(devSyncs>0||performance.now()>60000){clearInterval(earlySync);return;} syncDevices(); }, 5000);
 
 async function loadDevices(refresh){
   $('device').innerHTML='<option>scanning…</option>';
   try{
     const j=await api('/api/devices'+(refresh?'?refresh=1':''));
     $('device').innerHTML = deviceOptions(j.devices) || '<option value="">none found</option>';
-    const pref = j.connected || j.preferred;
-    const have = pref && [...$('device').options].some(o=>o.value===pref);
-    if(have) $('device').value=pref;
-    /* Only auto-attach to a device we have actually used before. Attaching to
-       whatever happened to sort first grabs an arbitrary speaker - and if that
-       one is idle, it looks exactly like "nothing is playing". */
-    if(have) attach();
-    else if(pref){                       // remembered device has not answered yet
-      msg('looking for '+pref+'…');
-      setTimeout(()=>loadDevices(true), 6000);
+    /* Attach to whatever is actually playing rather than to a remembered choice.
+       mDNS reports which speakers are busy, so this needs nothing stored. */
+    const pick = j.connected || j.active;
+    const have = pick && [...$('device').options].some(o=>o.value===pick);
+    if(have){ $('device').value=pick; attach(); msg(''); }
+    else if(j.active_count>1){
+      msg('more than one speaker is playing — pick the one you want','ok');
     }
-    else { msg('pick a speaker to connect','ok');
-           $('noplayer').textContent='Choose a speaker above, then cast a link.'; }
+    else { msg('');
+           $('noplayer').textContent='Pick a speaker above, then cast a link or play a playlist.'; }
   }catch(e){ $('device').innerHTML='<option value="">scan failed</option>'; msg(e.message,'err'); }
 }
 
@@ -825,6 +860,12 @@ $('plqueue').onclick=async()=>{
 async function tick(){
   try{
     const s=await api('/api/status');
+    if(!s.connected){
+      clearVideo('Not connected to a speaker yet. Pick one above.');
+      QTOTAL=0; renderQueue(null);
+    }
+    if(!s.connected){ clearVideo('Not connected to a speaker yet. Pick one above.');
+                      QTOTAL=0; renderQueue(null); }
     if(s.connected){
       $('state').textContent=s.state||'—';
       $('dot').className='dot '+(s.state==='PLAYING'?'on':s.state==='BUFFERING'?'buf':'');

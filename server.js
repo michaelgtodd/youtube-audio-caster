@@ -131,7 +131,7 @@ async function identify(title, duration) {
 /* A persistent browser beats one-shot queries: Cast devices answer at their own
    pace, and a short window silently under-reports on a busy network. */
 const DEV = new Map();
-let bonjourInst = null, browserInst = null;
+let bonjourInst = null, browserInst = null, settledOnce = false;
 
 function addService(svc) {
   const txt = svc.txt || {};
@@ -140,10 +140,15 @@ function addService(svc) {
   if (!name || !host) return;
   const ca = parseInt(txt.ca || '0', 10);
   const port = svc.port || 8009;
+  /* st=1 means the device has something loaded and rs is what it is, both
+     straight from mDNS - so "which speaker is playing" needs no connection and
+     no remembered preference. */
   DEV.set(name, { name, model: txt.md || '?', host, port,
-    audio_only: !(ca & 1),
+    audio_only: !(ca & 1),                    // ca bit 0 = VIDEO_OUT
     is_group: /group/i.test(txt.md || '') || port !== 8009,
-    seen: Date.now() });   // ca bit 0 = VIDEO_OUT
+    busy: String(txt.st || '0') === '1',
+    status_text: txt.rs || '',
+    seen: Date.now() });
 }
 
 function deviceList() {
@@ -209,7 +214,6 @@ async function connectDevice(name) {
   catch (e) { console.log(`[connect] FAILED ${dev.host}:${dev.port}: ${e && e.message}`); throw e; }
   console.log(`[connect] tls up to ${dev.host}:${dev.port}${dev.is_group ? ' (group)' : ''}`);
   S.client = client; S.device = name; S.host = dev.host;
-  saveSettings({ ...loadSettings(), lastDevice: name });
   return { client, dev };
 }
 
@@ -518,10 +522,19 @@ app.use(express.static(path.join(__dirname, 'renderer')));
 
 app.get('/api/devices', async (req, res) => {
   try {
-    const want = loadSettings().lastDevice || null;
-    if (req.query.refresh === '1') await discover(15000, want);
-    else if (!DEV.size || (want && !DEV.has(want))) await discover(12000, want);
-    res.json({ devices: deviceList(), connected: S.device, preferred: want });
+    /* The first answer has to be a settled list. Devices reply to mDNS at their
+       own pace, and returning early is how the picker ends up short. */
+    if (req.query.refresh === '1' || !settledOnce) {
+      await discover(req.query.refresh === '1' ? 15000 : 12000);
+      settledOnce = true;
+    }
+    const devices = deviceList();
+    /* Auto-attach only when exactly one audio-only speaker is busy - never to a
+       video device, which would mean walking in on someone's film. */
+    const active = devices.filter(d => d.busy && d.audio_only);
+    res.json({ devices, connected: S.device, settled: settledOnce,
+               active: active.length === 1 ? active[0].name : null,
+               active_count: active.length });
   } catch (e) { logErr(e); res.status(500).json({ error: String(e) }); }
 });
 
