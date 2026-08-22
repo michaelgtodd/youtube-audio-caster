@@ -1,188 +1,89 @@
 # YouTube Audio Caster
 
-Cast a YouTube video's **audio** to an audio-only Google speaker (Nest Mini, Nest
-Audio, Google Home Speaker) as a **native buffered Cast stream** — instead of
-real-time screen/tab mirroring, which stutters on any imperfect Wi-Fi.
+Play the sound from any YouTube video on a Google speaker — a Nest Mini, Nest Audio,
+Google Home Speaker, or a whole speaker group — while the video plays on your screen,
+kept in sync.
 
-Desktop app (Electron, macOS/Windows) or headless server (Node) you can run on a
-Raspberry Pi or NAS.
+![The app playing a video to a speaker, with the queue alongside](docs/app.png)
 
----
+## Why this exists
 
-## The problem
+YouTube won't send a video to a speaker. Speakers don't appear in its cast list at
+all, because they can't show picture. The usual workaround is to mirror your
+computer's sound to the speaker, and that stutters — every hiccup in your Wi-Fi
+becomes a gap in the music.
 
-YouTube won't cast a video to an audio-only speaker. Cast receivers advertise a
-capability bitmask, and the YouTube app filters its device picker to receivers
-with the `VIDEO_OUT` bit:
+## The one technical thing worth knowing
 
-```
-Google Home Speaker   ca=198660   AUDIO_OUT              <- hidden by YouTube
-Nest Hub / Chromecast ca=231941   VIDEO_OUT, AUDIO_OUT   <- listed
-```
+Mirroring makes **your computer** the source: it's streaming continuously, and the
+speaker plays whatever arrives the instant it arrives. Nothing is held in reserve, so
+a momentary stumble is a dropout you hear.
 
-So the only way to get a video's audio onto a good speaker is **tab or device
-mirroring** — and mirroring is a real-time UDP push with a jitter buffer measured
-in milliseconds. Any network stall longer than that budget is a permanent,
-audible dropout. There is no recovery, because there is no buffer to recover from.
+This app works differently. It hands the speaker the address of the audio and lets
+the **speaker fetch it straight from YouTube itself**. Your computer isn't in the
+middle. The speaker keeps a healthy buffer, so brief network trouble passes
+unnoticed — and you can close the window entirely and the music keeps playing.
 
-## The fix
+Meanwhile the app keeps the video on your screen lined up with what the speaker is
+playing, so you can watch along.
 
-Don't mirror. Hand the speaker the **audio-only stream URL** that YouTube already
-publishes (format 140, AAC ~129kbps) and let it play natively:
+## What you can do
 
-- The speaker fetches from Google's CDN over **TCP**, with retransmission
-- It buffers **seconds** ahead instead of milliseconds
-- Your computer isn't in the audio path at all — it just passes a URL
-- Nothing is re-encoded; the original AAC stream is passed through untouched
+- Send any YouTube video's audio to a speaker or speaker group
+- Watch the video while you listen, automatically kept in step
+- Build playlists, shuffle them, repeat one track or the whole thing
+- Queue up more videos on the fly, without editing a playlist
+- Drop the video into theater mode or true fullscreen
+- Copy a link to whatever's playing, optionally starting at the current moment
 
-**This fixes the symptom without fixing the network** — which matters when the
-marginal link isn't yours to fix.
+## Getting it running
 
-### Measured
-
-Same speaker, same Wi-Fi, measured back to back. Ten minutes of native casting
-while simultaneously pinging the speaker at 5Hz:
+You'll need [Node.js](https://nodejs.org) installed. Then, in a terminal:
 
 ```
-NETWORK (still bad, measured live during playback):
-  pings 2944   median 5.4ms   >40ms: 369 (12.5%)   max 354ms
-AUDIO:
-  rebuffer events: 0
-  PLAYING 99.8% of the run
-```
-
-The network stalls did not go away — 12.5% of packets still arrived late, with
-spikes to 354ms. The audio simply stopped caring.
-
----
-
-## Install
-
-Requires Node 18+.
-
-```bash
 git clone https://github.com/michaelgtodd/youtube-audio-caster
 cd youtube-audio-caster
-npm install            # postinstall fetches the yt-dlp binary for your platform
-npm start              # launch the desktop app
+npm install
+npm start
 ```
 
-Headless (Raspberry Pi, NAS, any always-on box):
+The app lives in your **menu bar** rather than the Dock. Click the speaker icon to
+show or hide the window; right-click it for a menu.
 
-```bash
-HOST=0.0.0.0 PORT=8765 npm run server
-```
+## Using it
 
-> `HOST=0.0.0.0` exposes it on your LAN and **there is no authentication**.
-> Trusted networks only.
+1. Pick your speaker from the dropdown
+2. Paste a YouTube link
+3. Press **Cast**
 
-## Use
+Press **＋ Queue** instead and it's added after whatever is already playing.
 
-1. Paste a YouTube link
-2. Pick a speaker — audio-only devices are listed first
-3. Cast
-
-The video plays locally in the app, muted, and follows the speaker's clock
-(re-seeking when drift exceeds 1.5s). Closing the window doesn't stop playback —
-the speaker is streaming on its own.
-
----
+![Building a playlist](docs/playlists.png)
 
 ## Playlists
 
-Build playlists of videos and play them in sequence, with shuffle and repeat.
-They are stored in the app's userData directory as `playlists.json` - personal to
-your machine, never committed.
+Make a playlist, then paste links into it — a single video, or a whole YouTube
+playlist link to bring in everything at once. Drag to reorder, click any track to
+start there, or use **＋ Queue all** to add the lot to what's already playing.
 
-- paste a **video link** to add one track, or a **YouTube playlist link** to
-  import the whole thing in one go (tested at 183 items)
-- drag to reorder, click any track to start from there
-- shuffle keeps whatever is playing and reshuffles everything else
-- repeat cycles off -> all -> one
-- adds are **non-blocking**: the request returns in under 100ms and resolves in
-  the background, so links can be pasted back to back without the UI freezing
-- the next track's stream is resolved **while the current one is still playing**,
-  so advancing is just a `load()` - without that prefetch the gap between tracks
-  is around nine seconds of yt-dlp extraction
+Your playlists are saved on your own computer and never leave it.
 
-Adding a single video through yt-dlp takes about 8 seconds - it is network bound,
-making several sequential calls to YouTube's player APIs, and pinning the player
-client does not help. YouTube's oEmbed endpoint returns the title in ~0.1s from a
-single request, so items appear from oEmbed immediately and the one field it
-lacks - duration - is backfilled afterwards. Importing a playlist URL stays a
-single yt-dlp call, which is already efficient at roughly 0.04s per item.
+## Theater and fullscreen
 
-End-of-track detection is event driven. Polling `getStatus()` does not work: once
-a track finishes the receiver stops returning a media status at all, so there is
-no `IDLE`/`FINISHED` to observe - the call simply yields null. The player does
-push a status message carrying `idleReason`, so that is what advances the queue.
+**Theater** fills the window with the video. **Fullscreen** takes over the whole
+screen with nothing else on it. Press Esc to come back from either.
 
-## What it handles
+![Theater mode](docs/theater.png)
 
-**Attaches to sessions it didn't start.** Cast allows one receiver app and one
-media session, but many controllers. Open the app while something is already
-playing and it joins that session — displaying and controlling it without
-interrupting.
+## Good to know
 
-**Identifies what's playing.** The CDN URL carries only an opaque token, so the
-video ID can't be read back from it. Two strategies, in order:
-
-1. **Exact recall** — every cast is recorded (`sessionId`, `contentId`, CDN
-   token, title+duration), so re-attaching is a lookup, not a guess.
-2. **Fingerprint fallback** — for sessions nothing recorded, search by title and
-   match on millisecond-precision duration. Requires a delta under 2s *and* a
-   clear margin over the runner-up; otherwise it reports no match rather than
-   showing you the wrong video.
-
-**Evicts squatting apps.** A resident mirroring receiver holds the device and
-**silently ignores `load()`** — it reports success while continuing to play the
-old stream. Any resident non-`CC1AD845` app is stopped first.
-
-**Auto-refreshes expiring URLs.** Google's CDN URLs expire (~6h) and are bound to
-the requesting public IP. A backend watchdog re-issues 5 minutes before expiry
-and seeks back to position, and recovers from `IDLE`/`ERROR`. It runs server-side,
-so it works with no browser open.
-
-## Architecture
-
-```
-Electron shell (main.js)
-  └── Node server (server.js)  ← also runs standalone, headless
-        ├── castv2-client      Cast protocol (TLS/protobuf, port 8009)
-        ├── bonjour-service    persistent mDNS discovery
-        ├── bin/yt-dlp         audio-only stream extraction
-        └── sessions.json      session → video mappings
-  └── renderer/index.html      UI + YouTube IFrame API (video, muted, synced)
-```
-
-The server binds to a random loopback port inside the app. Discovery is a
-**persistent** mDNS browser rather than one-shot queries — Cast devices answer at
-their own pace, and a short window silently under-reports on a busy network.
-
-## Speaker groups
-
-Cast groups work as targets and are labelled "group" in the picker. They do **not**
-listen on 8009 - a group advertises a random high port, and connecting to 8009 on
-that host silently reaches one member speaker instead of the group. The advertised
-port is used.
-
-## Limitations
-
-- **YouTube only** — relies on yt-dlp's extractor
-- **yt-dlp goes stale.** YouTube changes break older builds; run
-  `npm run update-ytdlp` if extraction starts failing
-- **Live streams** have no duration, so identification falls back to exact-title
-  match and is flagged low confidence
-- **Unsigned builds.** macOS Gatekeeper and Windows SmartScreen will warn until
-  the app is signed and notarized
-- **No auth** on the HTTP API
-
-## Roadmap
-
-- [ ] Windows build + `electron-builder` packaging
-- [ ] Code signing / notarization
-- [ ] Queue and playlist support
-- [ ] Auto-update for the bundled yt-dlp binary
+- Works with YouTube links only
+- If videos suddenly stop loading, YouTube has probably changed something — run
+  `npm run update-ytdlp` and try again
+- The app isn't digitally signed yet, so the first time you open it macOS or
+  Windows may warn you; right-click and choose Open
+- Anyone on your network can reach it if you deliberately share it; by default it's
+  only reachable from your own machine
 
 ## License
 

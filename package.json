@@ -7,7 +7,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "electron .",
     "server": "node server.js",
-    "postinstall": "sh scripts/fetch-ytdlp.sh",
+    "postinstall": "sh scripts/fetch-ytdlp.sh && node scripts/make-icon.js",
     "update-ytdlp": "sh scripts/fetch-ytdlp.sh",
     "icon": "node scripts/make-icon.js"
   },
