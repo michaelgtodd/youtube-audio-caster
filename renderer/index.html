@@ -514,6 +514,7 @@ const esc=t=>String(t==null?'':t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;'
 
 function renderItems(){
   const box=$('plitems');
+  const keepScroll=box.scrollTop;
   if(!CURPL){ box.innerHTML=''; $('plcount').textContent=''; return; }
   $('plcount').textContent = CURPL.items.length+' item'+(CURPL.items.length===1?'':'s');
   box.innerHTML = CURPL.items.map((it,i)=>`
@@ -526,6 +527,7 @@ function renderItems(){
       <button class="pli-b play" data-a="play" title="Play from here">▶</button>
       <button class="pli-b del" data-a="del" title="Remove">✕</button>
     </div>`).join('');
+  box.scrollTop=keepScroll;
 }
 
 $('plitems').addEventListener('click', async e=>{
@@ -727,22 +729,37 @@ $('repeat').onclick=async()=>{
 let QV=-1, QITEMS=[];
 /* Highlight moves on its own so a skip shows in the sidebar instantly, without
    waiting for the status poll that is deliberately held during a skip. */
+let LASTQPOS=-1;
+/* scrollIntoView() also scrolls every ancestor scroll container, including the
+   page itself - running that on each status poll yanked the window back up
+   while you were scrolling. Scroll only the queue box, and only when the
+   highlighted track actually changes. */
+function scrollQueueInto(el){
+  const box=$('qitems');
+  if(!el||!box) return;
+  const top=el.offsetTop, bot=top+el.offsetHeight;
+  if(top<box.scrollTop) box.scrollTop=top;
+  else if(bot>box.scrollTop+box.clientHeight) box.scrollTop=bot-box.clientHeight;
+}
 function highlightQueue(pos,total){
+  let cur=null;
   $('qitems').querySelectorAll('.qi').forEach(el=>{
     const on=(+el.dataset.qpos===pos);
     el.classList.toggle('now',on);
-    if(on) el.scrollIntoView({block:'nearest'});
+    if(on) cur=el;
   });
+  if(pos!==LASTQPOS){ LASTQPOS=pos; scrollQueueInto(cur); }
   if(total!=null) $('qmeta').textContent=`${pos+1} / ${total}`;
 }
 async function renderQueue(q){
   /* the panel only earns its space when something is actually queued behind
      the current track */
   document.body.classList.toggle('noqueue', !(q && q.total > 1));
-  if(!q || q.total<2){ QV=-1; QITEMS=[]; $('qitems').innerHTML=''; $('qmeta').textContent=''; return; }
+  if(!q || q.total<2){ QV=-1; QITEMS=[]; LASTQPOS=-1;
+    $('qitems').innerHTML=''; $('qmeta').textContent=''; return; }
   if(q.version!==QV){
     try{ const j=await api('/api/queue');
-      if(j && j.items){ QITEMS=j.items; QV=q.version;
+      if(j && j.items){ QITEMS=j.items; QV=q.version; LASTQPOS=-1;
         $('qitems').innerHTML=QITEMS.map((it,n)=>`<div class="qi" data-qpos="${n}">
           <span class="qi-n">${n+1}</span>
           <img class="qi-th" src="${esc(it.thumb||'')}" alt="" onerror="this.style.visibility='hidden'">
