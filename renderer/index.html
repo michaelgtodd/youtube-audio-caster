@@ -59,6 +59,13 @@ button:disabled{opacity:.45;cursor:default}
 .meta{font-size:12.5px;color:var(--muted);margin-top:10px;word-break:break-word}
 label.sm{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
 .aud{font-size:11px;background:var(--chip);border-radius:5px;padding:1px 6px;color:var(--muted)}
+#linkrow{display:none;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}
+#ytlink{flex:1;min-width:200px;font-size:12.5px;color:var(--accent);text-decoration:none;
+  background:var(--chip);border-radius:7px;padding:7px 10px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
+#ytlink:hover{text-decoration:underline}
+button.mini{padding:7px 12px;font-size:12.5px}
+button.mini.done{background:var(--ok)}
 </style>
 </head>
 <body>
@@ -106,6 +113,11 @@ label.sm{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6
       <div class="stat"><div class="k">audio</div><div class="v" id="codec" style="font-size:13px">—</div></div>
     </div>
     <div class="meta" id="title"></div>
+    <div id="linkrow">
+      <a id="ytlink" href="#" target="_blank" rel="noreferrer" title="open in your browser"></a>
+      <button class="ghost mini" id="copylink">Copy</button>
+      <label class="sm"><input type="checkbox" id="attime"> at current time</label>
+    </div>
   </div>
 </div>
 
@@ -271,6 +283,43 @@ async function doSeek(t){
   }catch(e){ msg('seek failed: '+e.message,'err'); seekLock=0; seekTarget=null; }
 }
 
+/* The url actually being played is a ~900-char googlevideo CDN blob that is
+   IP-bound and expires. Show the shareable watch url instead, optionally
+   stamped with the current position. */
+let LINK_VID=null, LINK_POS=0;
+function updateLink(vid, pos){
+  LINK_VID=vid; LINK_POS=pos||0;
+  if(!vid){ $('linkrow').style.display='none'; return; }
+  const t=$('attime').checked ? Math.floor(LINK_POS) : null;
+  const url='https://www.youtube.com/watch?v='+vid+(t?('&t='+t+'s'):'');
+  const a=$('ytlink');
+  if(a.textContent!==url){ a.textContent=url; a.href=url; }
+  $('linkrow').style.display='flex';
+}
+$('attime').addEventListener('change',()=>updateLink(LINK_VID,LINK_POS));
+
+async function copyText(txt){
+  try{ await navigator.clipboard.writeText(txt); return true; }
+  catch(e){
+    try{                                   // fallback if the async API is unavailable
+      const ta=document.createElement('textarea');
+      ta.value=txt; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.select();
+      const ok=document.execCommand('copy'); ta.remove(); return ok;
+    }catch(e2){ clog('copy failed: '+e2.message); return false; }
+  }
+}
+$('copylink').onclick=async()=>{
+  const b=$('copylink'), url=$('ytlink').textContent;
+  if(!url) return;
+  const ok=await copyText(url);
+  b.textContent = ok ? 'Copied ✓' : 'Copy failed';
+  b.classList.toggle('done', ok);
+  clog('copy link '+(ok?'ok':'FAILED'));
+  setTimeout(()=>{ b.textContent='Copy'; b.classList.remove('done'); }, 1400);
+};
+clog('clipboard api available: '+(!!(navigator.clipboard&&navigator.clipboard.writeText)));
+
 async function tick(){
   try{
     const s=await api('/api/status');
@@ -298,6 +347,7 @@ async function tick(){
       }
       if(typeof s.volume==='number' && document.activeElement!==$('vol'))
         $('vol').value=Math.round(s.volume*100);
+      updateLink(s.media && s.media.video_id, pos);
       if(s.media&&s.media.video_id&&$('showvid').checked) mountVideo(s.media.video_id);
       else if(s.media&&!s.media.video_id&&s.media.identified&&s.media.identified.confidence==='none')
         $('noplayer').textContent="Couldn't identify this stream, so there's no video to show. "
