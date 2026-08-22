@@ -99,9 +99,18 @@ your machine, never committed.
 - drag to reorder, click any track to start from there
 - shuffle keeps whatever is playing and reshuffles everything else
 - repeat cycles off -> all -> one
+- adds are **non-blocking**: the request returns in under 100ms and resolves in
+  the background, so links can be pasted back to back without the UI freezing
 - the next track's stream is resolved **while the current one is still playing**,
   so advancing is just a `load()` - without that prefetch the gap between tracks
   is around nine seconds of yt-dlp extraction
+
+Adding a single video through yt-dlp takes about 8 seconds - it is network bound,
+making several sequential calls to YouTube's player APIs, and pinning the player
+client does not help. YouTube's oEmbed endpoint returns the title in ~0.1s from a
+single request, so items appear from oEmbed immediately and the one field it
+lacks - duration - is backfilled afterwards. Importing a playlist URL stays a
+single yt-dlp call, which is already efficient at roughly 0.04s per item.
 
 End-of-track detection is event driven. Polling `getStatus()` does not work: once
 a track finishes the receiver stops returning a media status at all, so there is

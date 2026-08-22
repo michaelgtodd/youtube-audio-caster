@@ -48,6 +48,22 @@ async function extract(pageUrl) {
     thumb: info.thumbnail || null, video_id: info.id };
 }
 
+const VID_RE = [/[?&]v=([A-Za-z0-9_-]{11})/, /youtu\.be\/([A-Za-z0-9_-]{11})/,
+                /\/shorts\/([A-Za-z0-9_-]{11})/, /\/embed\/([A-Za-z0-9_-]{11})/];
+const videoIdOf = u => { for (const r of VID_RE) { const m = String(u).match(r); if (m) return m[1]; } return null; };
+const isPlaylistUrl = u => /\/playlist\b/.test(u) || (/[?&]list=/.test(u) && !videoIdOf(u));
+
+/* oEmbed is one HTTP request and returns in ~0.1s. yt-dlp needs ~8s for the same
+   video because it makes several sequential calls to YouTube's player APIs. Use
+   oEmbed for the title so an item can appear immediately; duration is the only
+   thing it lacks, and that gets filled in afterwards. */
+async function oembed(videoId) {
+  const u = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+  const r = await fetch(u, { signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error('oembed ' + r.status);
+  return r.json();
+}
+
 async function resolveItems(pageUrl) {
   const info = JSON.parse(await ytdlp(['-4', '--no-warnings', '-J', '--flat-playlist', pageUrl]));
   const mk = e => ({ video_id: e.id, title: e.title || e.id,
@@ -282,6 +298,61 @@ async function castUrl(pageUrl, name) {
   let sid = null; try { sid = ((await p(client, 'getSessions')) || [])[0]?.sessionId; } catch {}
   remember(m.video_id, pageUrl, m.title, m.duration, m.url, sid);
   return S.media;
+}
+
+/* ---------- background add jobs ----------
+   Adding used to block the request for ~8s per video, which froze the UI and
+   made adding several links painful. Jobs are queued instead: the item appears
+   from oEmbed almost immediately and duration is backfilled after. */
+S.jobs = [];
+let jobSeq = 0, running = 0;
+const MAX_JOBS = 3;
+
+function addJob(playlistId, url) {
+  const job = { id: ++jobSeq, playlistId, url, state: 'pending', added: 0, msg: '' };
+  S.jobs.push(job);
+  S.jobs = S.jobs.slice(-40);
+  pumpJobs();
+  return job;
+}
+
+function pumpJobs() {
+  while (running < MAX_JOBS) {
+    const job = S.jobs.find(j => j.state === 'pending');
+    if (!job) return;
+    job.state = 'running'; running++;
+    runJob(job).catch(e => { job.state = 'error'; job.msg = String(e.message || e); })
+      .finally(() => { running--; pumpJobs(); });
+  }
+}
+
+async function runJob(job) {
+  const vid = videoIdOf(job.url);
+  if (vid && !isPlaylistUrl(job.url)) {
+    // fast path: show it now, get the duration later
+    let title = vid, thumb = `https://i.ytimg.com/vi/${vid}/mqdefault.jpg`;
+    try { const o = await oembed(vid); title = o.title || vid; } catch (e) { logErr('oembed: ' + e.message); }
+    const item = { video_id: vid, title, duration: null,
+                   url: 'https://www.youtube.com/watch?v=' + vid, thumb };
+    if (!PL.addItems(job.playlistId, [item])) throw new Error('no such playlist');
+    job.added = 1; job.state = 'done'; job.msg = title;
+    console.log(`[add] ${title.slice(0, 44)} (duration pending)`);
+    try {                                   // backfill duration without blocking anything
+      const info = JSON.parse(await ytdlp(['-4', '--no-warnings', '--no-playlist', '-J',
+        '--flat-playlist', item.url]));
+      if (info && info.duration) {
+        PL.updateItem(job.playlistId, vid, { duration: info.duration });
+        console.log(`[add] duration ${info.duration}s for ${title.slice(0, 30)}`);
+      }
+    } catch (e) { logErr('duration backfill: ' + e.message); }
+    return;
+  }
+  // playlist url: one yt-dlp call covers every entry, durations included
+  const items = await resolveItems(job.url);
+  if (!items.length) throw new Error('nothing found at that url');
+  if (!PL.addItems(job.playlistId, items)) throw new Error('no such playlist');
+  job.added = items.length; job.state = 'done'; job.msg = `${items.length} items`;
+  console.log(`[add] +${items.length} items`);
 }
 
 /* ---------- playlist queue ---------- */
@@ -521,15 +592,17 @@ app.delete('/api/playlists/:id', (req, res) => {
 });
 
 /* accepts a video url or a whole youtube playlist url */
-app.post('/api/playlists/:id/add', asyncRoute(async (req, res) => {
+app.post('/api/playlists/:id/add', (req, res) => {
   const url = ((req.body || {}).url || '').trim();
   if (!url) return res.status(400).json({ error: 'no url' });
-  const items = await resolveItems(url);
-  if (!items.length) return res.status(400).json({ error: 'nothing found at that url' });
-  const pl = PL.addItems(req.params.id, items);
-  if (!pl) return res.status(404).json({ error: 'no such playlist' });
-  console.log(`[playlists] +${items.length} to ${pl.name}`);
-  res.json({ ok: true, added: items.length, playlist: pl });
+  if (!PL.get(req.params.id)) return res.status(404).json({ error: 'no such playlist' });
+  const job = addJob(req.params.id, url);
+  res.json({ ok: true, job: job.id, queued: true });   // returns instantly
+});
+
+app.get('/api/jobs', (req, res) => res.json({
+  jobs: S.jobs.slice(-12),
+  busy: S.jobs.filter(j => j.state === 'pending' || j.state === 'running').length,
 }));
 
 app.delete('/api/playlists/:id/item/:idx', (req, res) => {

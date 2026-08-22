@@ -66,4 +66,11 @@ const move = (id, from, to) => mutate(id, p => {
 
 const clear = id => mutate(id, p => { p.items = []; });
 
-module.exports = { init, load, get, create, rename, remove, addItems, removeItem, move, clear };
+/* patch one item in place, matched by video id (used to fill in duration later) */
+const updateItem = (id, video_id, patch) => mutate(id, p => {
+  const it = p.items.find(i => i.video_id === video_id);
+  if (!it) return false;
+  Object.assign(it, patch);
+});
+
+module.exports = { init, load, get, create, rename, remove, addItems, removeItem, move, clear, updateItem };

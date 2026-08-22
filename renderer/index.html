@@ -445,7 +445,7 @@ function renderItems(){
       <span class="pli-n">${i+1}</span>
       <img class="pli-thumb" src="${esc(it.thumb||'')}" alt="" onerror="this.style.visibility='hidden'">
       <span class="pli-t" title="${esc(it.title)}">${esc(it.title)}</span>
-      <span class="pli-d">${it.duration?fmt(it.duration):''}</span>
+      <span class="pli-d">${it.duration?fmt(it.duration):'·'}</span>
       <button class="pli-b play" data-a="play" title="Play from here">▶</button>
       <button class="pli-b del" data-a="del" title="Remove">✕</button>
     </div>`).join('');
@@ -526,19 +526,42 @@ $('pldel').onclick=async()=>{
     CURPL=null; await loadPlaylists();
   }catch(e){ plmsg(e.message,'err'); }
 };
+/* Adds are queued server-side and resolve in the background, so the button
+   never blocks and links can be pasted back to back. */
+let JOBPOLL=null;
 $('pladdbtn').onclick=async()=>{
   if(!CURPL) return plmsg('create a playlist first','err');
   const url=$('pladd').value.trim(); if(!url) return;
-  $('pladdbtn').disabled=true; plmsg('resolving… (a full playlist link can take a moment)');
+  $('pladd').value=''; $('pladd').focus();
   try{
-    const j=await api(`/api/playlists/${CURPL.id}/add`,{method:'POST',
+    await api(`/api/playlists/${CURPL.id}/add`,{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-    CURPL=j.playlist; renderItems(); $('pladd').value='';
-    plmsg(`added ${j.added} item${j.added===1?'':'s'}`,'ok');
-    setTimeout(()=>plmsg(''),2500);
+    pollJobs();
   }catch(e){ plmsg(e.message,'err'); }
-  $('pladdbtn').disabled=false;
 };
+
+async function pollJobs(){
+  if(JOBPOLL) return;
+  const step=async()=>{
+    try{
+      const j=await api('/api/jobs');
+      const done=j.jobs.filter(x=>x.state==='done').length;
+      const bad=j.jobs.filter(x=>x.state==='error');
+      if(j.busy>0) plmsg(`resolving ${j.busy} link${j.busy===1?'':'s'}…`);
+      else if(bad.length) plmsg(bad[bad.length-1].msg||'failed to resolve','err');
+      else plmsg('');
+      if(CURPL){                       // pull in whatever has landed
+        const pl=(await api('/api/playlists')).playlists.find(p=>p.id===CURPL.id);
+        if(pl && JSON.stringify(pl.items)!==JSON.stringify(CURPL.items)){
+          CURPL=pl; renderItems();
+        }
+      }
+      if(j.busy===0){ clearInterval(JOBPOLL); JOBPOLL=null;
+        setTimeout(()=>{ if(!JOBPOLL) plmsg(''); },2500); }
+    }catch(e){ clearInterval(JOBPOLL); JOBPOLL=null; }
+  };
+  JOBPOLL=setInterval(step,1200); step();
+}
 $('pladd').addEventListener('keydown',e=>{ if(e.key==='Enter') $('pladdbtn').click(); });
 $('plplay').onclick=()=>playFrom(0);
 
