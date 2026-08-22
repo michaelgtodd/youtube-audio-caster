@@ -38,8 +38,19 @@ button:disabled{opacity:.45;cursor:default}
 .stat .v{font-size:16px;font-weight:600;margin-top:3px;font-variant-numeric:tabular-nums}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;background:var(--muted)}
 .dot.on{background:var(--ok)} .dot.buf{background:#e8a33d} .dot.err{background:var(--warn)}
-.bar{height:5px;background:var(--chip);border-radius:99px;overflow:hidden;margin:12px 0 4px}
-.bar>i{display:block;height:100%;background:var(--accent);width:0}
+.bar{position:relative;height:18px;display:flex;align-items:center;margin:8px 0 2px;
+  cursor:pointer;touch-action:none;user-select:none}
+.bar .track{position:relative;width:100%;height:5px;background:var(--chip);border-radius:99px}
+.bar .fill{position:absolute;inset:0 auto 0 0;width:0;background:var(--accent);border-radius:99px}
+.bar .thumb{position:absolute;top:50%;left:0;width:12px;height:12px;margin:-6px 0 0 -6px;
+  border-radius:50%;background:var(--accent);opacity:0;transition:opacity .12s}
+.bar:hover .thumb,.bar.scrubbing .thumb{opacity:1}
+.bar .bubble{position:absolute;bottom:22px;left:0;transform:translateX(-50%);white-space:nowrap;
+  background:var(--ink);color:var(--panel);font-size:11px;padding:2px 6px;border-radius:5px;
+  opacity:0;pointer-events:none;font-variant-numeric:tabular-nums;transition:opacity .12s}
+.bar:hover .bubble,.bar.scrubbing .bubble{opacity:1}
+.bar.disabled{cursor:default}
+.bar.disabled .thumb,.bar.disabled .bubble{display:none}
 .time{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);
   font-variant-numeric:tabular-nums}
 .msg{font-size:13px;padding:10px 12px;border-radius:8px;margin-top:10px}
@@ -71,7 +82,10 @@ label.sm{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6
     <div id="noplayer" class="meta">Video appears here once you cast. Audio goes to the speaker;
       this player is muted and follows the speaker's position.</div>
 
-    <div class="bar"><i id="prog"></i></div>
+    <div class="bar disabled" id="bar" title="click or drag to seek">
+      <div class="track"><div class="fill" id="prog"></div><div class="thumb" id="thumb"></div></div>
+      <div class="bubble" id="bubble">0:00</div>
+    </div>
     <div class="time"><span id="tcur">0:00</span><span id="tdur">0:00</span></div>
 
     <div class="row" style="margin-top:12px">
@@ -213,6 +227,50 @@ $('showvid').onchange=e=>{
     if(YT_PLAYER&&YT_PLAYER.playVideo)YT_PLAYER.playVideo();}
 };
 
+/* Cast exposes a native seek: the speaker re-buffers from the CDN over range
+   requests. The only trick is not letting status polling snap the bar backwards
+   before the receiver reports the new position. */
+let DUR=0, scrubbing=false, seekLock=0, seekTarget=null;
+const bar=()=>$('bar');
+function pctAt(e){ const r=bar().getBoundingClientRect();
+  return Math.max(0, Math.min(1, (e.clientX-r.left)/r.width)); }
+function paintBar(pct){
+  const s=(pct*100).toFixed(2)+'%';
+  $('prog').style.width=s; $('thumb').style.left=s; $('bubble').style.left=s;
+}
+function showBubble(pct){ $('bubble').textContent=fmt(pct*DUR); $('bubble').style.left=(pct*100)+'%'; }
+
+bar().addEventListener('pointermove', e=>{
+  if(!DUR) return;
+  const p=pctAt(e); showBubble(p);
+  if(scrubbing){ paintBar(p); $('tcur').textContent=fmt(p*DUR); }
+});
+bar().addEventListener('pointerdown', e=>{
+  if(!DUR) return;
+  scrubbing=true; bar().classList.add('scrubbing'); bar().setPointerCapture(e.pointerId);
+  const p=pctAt(e); paintBar(p); showBubble(p); $('tcur').textContent=fmt(p*DUR);
+});
+bar().addEventListener('pointerup', async e=>{
+  if(!scrubbing) return;
+  scrubbing=false; bar().classList.remove('scrubbing');
+  try{ bar().releasePointerCapture(e.pointerId); }catch(_){}
+  await doSeek(pctAt(e)*DUR);
+});
+
+async function doSeek(t){
+  if(!DUR) return;
+  t=Math.max(0,Math.min(DUR-1,t));
+  seekTarget=t; seekLock=Date.now()+6000;      // hold the UI at the target
+  paintBar(t/DUR); $('tcur').textContent=fmt(t);
+  if(YT_PLAYER&&YT_PLAYER.seekTo){ SYNCING=true; YT_PLAYER.seekTo(t,true);
+    setTimeout(()=>SYNCING=false,1500); }
+  try{
+    await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'seek',value:t})});
+    clog('seek -> '+Math.round(t)+'s');
+  }catch(e){ msg('seek failed: '+e.message,'err'); seekLock=0; seekTarget=null; }
+}
+
 async function tick(){
   try{
     const s=await api('/api/status');
@@ -224,15 +282,28 @@ async function tick(){
       if(s.media) $('codec').textContent=`${s.media.acodec||'?'} ${s.media.abr?Math.round(s.media.abr)+'k':''}`;
       if(s.media&&s.media.title) $('title').textContent=s.media.title;
       const pos=s.position||0, dur=s.duration||0;
-      $('tcur').textContent=fmt(pos); $('tdur').textContent=fmt(dur);
-      $('prog').style.width = dur? (100*pos/dur).toFixed(2)+'%' : '0%';
+      DUR=dur;
+      bar().classList.toggle('disabled', !dur);
+      $('tdur').textContent=fmt(dur);
+      const locked = seekLock && Date.now()<seekLock && seekTarget!=null
+                     && Math.abs(pos-seekTarget)>3;
+      if(!locked){
+        if(seekLock && seekTarget!=null && Math.abs(pos-seekTarget)<=3){
+          seekLock=0; seekTarget=null;              // receiver caught up
+        }
+        if(!scrubbing){
+          $('tcur').textContent=fmt(pos);
+          paintBar(dur? pos/dur : 0);
+        }
+      }
       if(typeof s.volume==='number' && document.activeElement!==$('vol'))
         $('vol').value=Math.round(s.volume*100);
       if(s.media&&s.media.video_id&&$('showvid').checked) mountVideo(s.media.video_id);
       else if(s.media&&!s.media.video_id&&s.media.identified&&s.media.identified.confidence==='none')
         $('noplayer').textContent="Couldn't identify this stream, so there's no video to show. "
           +"Audio controls still work. Cast a link here to get the synced video.";
-      if(YT_PLAYER&&YT_PLAYER.getCurrentTime&&$('showvid').checked&&!SYNCING){
+      if(YT_PLAYER&&YT_PLAYER.getCurrentTime&&$('showvid').checked&&!SYNCING
+         &&!scrubbing&&!seekLock){
         const local=YT_PLAYER.getCurrentTime()||0;
         if(s.state==='PLAYING'){
           if(Math.abs(local-pos)>1.5){SYNCING=true;YT_PLAYER.seekTo(pos,true);
