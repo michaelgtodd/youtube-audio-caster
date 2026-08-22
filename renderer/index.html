@@ -75,6 +75,37 @@ label.sm{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6
   cursor:pointer;border-radius:5px;flex:none;opacity:0}
 .pli:hover .pli-b{opacity:1}
 .pli-b:hover{background:var(--bg);color:var(--ink)}
+.pgrid{display:grid;grid-template-columns:1fr;gap:16px}
+@media(min-width:860px){.pgrid{grid-template-columns:minmax(0,1fr) 280px}}
+.pside{display:flex;flex-direction:column;min-width:0;border-top:1px solid var(--line);padding-top:14px}
+@media(min-width:860px){.pside{border-top:0;border-left:1px solid var(--line);padding:0 0 0 16px}}
+.qhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;
+  font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+#qmeta{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+#qitems{display:flex;flex-direction:column;gap:1px;overflow-y:auto;max-height:360px}
+#qitems:empty{display:none}
+.qi{display:flex;gap:8px;align-items:center;padding:5px 6px;border-radius:7px;cursor:pointer;font-size:12.5px}
+.qi:hover{background:var(--chip)}
+.qi.now{background:color-mix(in srgb,var(--accent) 16%,transparent)}
+.qi.now .qi-t{color:var(--accent);font-weight:600}
+.qi-n{width:16px;flex:none;text-align:right;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.qi-th{width:44px;height:25px;flex:none;object-fit:cover;border-radius:3px;background:var(--chip)}
+.qi-t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qi-d{flex:none;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+#vidload{width:100%;aspect-ratio:16/9;border-radius:10px;background:#000;color:#9aa0a6;
+  display:flex;align-items:center;justify-content:center;gap:10px;font-size:13px}
+/* an id selector beats .hide, so hiding has to be stated at the same weight */
+#vidload.hide{display:none}
+#playerwrap.hide{display:none}
+.spin{width:22px;height:22px;border:2.5px solid rgba(255,255,255,.18);border-top-color:#fff;
+  border-radius:50%;animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+button.ic{display:inline-flex;align-items:center;justify-content:center;padding:9px 11px;position:relative}
+button.ic svg{width:16px;height:16px;display:block}
+button:disabled{opacity:.32;cursor:default}
+#repone{display:none;position:absolute;right:4px;bottom:3px;font-size:9px;font-weight:700;line-height:1}
+#repeat.one #repone{display:block}
+#transmsg .msg{margin-top:8px;margin-bottom:0}
 .tog{background:var(--chip);color:var(--muted)}
 .tog.on{background:var(--accent);color:#fff}
 #linkrow{display:none;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}
@@ -85,7 +116,9 @@ body.theater .wrap{padding:0;max-width:none;height:100vh;overflow:hidden}
 body.theater .card:not(#playercard){display:none}
 body.theater #playercard{position:fixed;inset:0;margin:0;padding:0;border:0;border-radius:0;
   background:#000;z-index:40;overflow:hidden}
-body.theater #playercard>*:not(#playerwrap){display:none}
+body.theater .pgrid{display:block}
+body.theater .pside{display:none}
+body.theater .pmain>*:not(#playerwrap){display:none}
 body.theater #playerwrap{position:absolute;inset:0;width:100%;height:100%;
   aspect-ratio:auto;border-radius:0}
 body.theater #playerwrap iframe{width:100%;height:100%}
@@ -119,44 +152,56 @@ button.mini.done{background:var(--ok)}
   </div>
 
   <div class="card" id="playercard">
-    <div id="playerwrap" class="hide"><div id="player"></div></div>
-    <div id="noplayer" class="meta">Video appears here once you cast. Audio goes to the speaker;
-      this player is muted and follows the speaker's position.</div>
+    <div class="pgrid">
+      <div class="pmain">
+        <div id="playerwrap" class="hide"><div id="player"></div></div>
+        <div id="vidload" class="hide"><div class="spin"></div><span>loading track…</span></div>
+        <div id="noplayer" class="meta">Video appears here once you cast. Audio goes to the speaker;
+          this player is muted and follows the speaker's position.</div>
 
-    <div class="bar disabled" id="bar" title="click or drag to seek">
-      <div class="track"><div class="fill" id="prog"></div><div class="thumb" id="thumb"></div></div>
-      <div class="bubble" id="bubble">0:00</div>
-    </div>
-    <div class="time"><span id="tcur">0:00</span><span id="tdur">0:00</span></div>
+        <div class="bar disabled" id="bar" title="click or drag to seek">
+          <div class="track"><div class="fill" id="prog"></div><div class="thumb" id="thumb"></div></div>
+          <div class="bubble" id="bubble">0:00</div>
+        </div>
+        <div class="time"><span id="tcur">0:00</span><span id="tdur">0:00</span></div>
 
-    <div class="row" style="margin-top:12px">
-      <button class="ghost" id="prev" title="Previous track">⏮</button>
-      <button class="ghost" id="play">▶︎ Play</button>
-      <button class="ghost" id="pause">❚❚ Pause</button>
-      <button class="ghost" id="next" title="Next track">⏭</button>
-      <button class="ghost" id="stop">■ Stop</button>
-      <button class="ghost tog" id="shuffle" title="Shuffle">⤨</button>
-      <button class="ghost tog" id="repeat" title="Repeat: off">↻</button>
-      <button class="ghost" id="refresh" title="Re-issue an expired CDN url and resume">↻ Refresh stream</button>
-      <label class="sm" style="margin-left:auto">vol
-        <input type="range" id="vol" min="0" max="100" value="80" style="width:110px">
-      </label>
-      <label class="sm"><input type="checkbox" id="showvid" checked> show video</label>
-      <button class="ghost mini" id="expand" title="Fill the window (Esc to exit)">⤢ Theater</button>
-      <button class="ghost mini" id="fullscreen" title="True fullscreen (Esc to exit)">⛶ Fullscreen</button>
-    </div>
+        <div class="row" style="margin-top:12px">
+          <button class="ghost ic" id="prev" title="Previous track"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="19 20 9 12 19 4"/><line x1="5" y1="19" x2="5" y2="5"/></svg></button>
+          <button class="ghost" id="play">▶︎ Play</button>
+          <button class="ghost" id="pause">❚❚ Pause</button>
+          <button class="ghost ic" id="next" title="Next track"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 4 15 12 5 20"/><line x1="19" y1="5" x2="19" y2="19"/></svg></button>
+          <button class="ghost" id="stop">■ Stop</button>
+          <button class="ghost ic tog" id="shuffle" title="Shuffle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg></button>
+          <button class="ghost ic tog" id="repeat" title="Repeat: off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg><b id="repone">1</b></button>
+          <button class="ghost" id="refresh" title="Re-issue an expired CDN url and resume">↻ Refresh stream</button>
+          <label class="sm" style="margin-left:auto">vol
+            <input type="range" id="vol" min="0" max="100" value="80" style="width:110px">
+          </label>
+          <label class="sm"><input type="checkbox" id="showvid" checked> show video</label>
+          <button class="ghost mini" id="expand" title="Fill the window (Esc to exit)">⤢ Theater</button>
+          <button class="ghost mini" id="fullscreen" title="True fullscreen (Esc to exit)">⛶ Fullscreen</button>
+        </div>
+        <div id="transmsg"></div>
 
-    <div class="grid">
-      <div class="stat"><div class="k">state</div><div class="v"><span class="dot" id="dot"></span><span id="state">idle</span></div></div>
-      <div class="stat"><div class="k">rebuffers</div><div class="v" id="rebuf">0</div></div>
-      <div class="stat"><div class="k">receiver</div><div class="v" id="recv" style="font-size:13px">—</div></div>
-      <div class="stat"><div class="k">audio</div><div class="v" id="codec" style="font-size:13px">—</div></div>
-    </div>
-    <div class="meta" id="title"></div>
-    <div id="linkrow">
-      <a id="ytlink" href="#" target="_blank" rel="noreferrer" title="open in your browser"></a>
-      <button class="ghost mini" id="copylink">Copy</button>
-      <label class="sm"><input type="checkbox" id="attime"> at current time</label>
+        <div class="grid">
+          <div class="stat"><div class="k">state</div><div class="v"><span class="dot" id="dot"></span><span id="state">idle</span></div></div>
+          <div class="stat"><div class="k">rebuffers</div><div class="v" id="rebuf">0</div></div>
+          <div class="stat"><div class="k">receiver</div><div class="v" id="recv" style="font-size:13px">—</div></div>
+          <div class="stat"><div class="k">audio</div><div class="v" id="codec" style="font-size:13px">—</div></div>
+        </div>
+        <div class="meta" id="title"></div>
+        <div id="linkrow">
+          <a id="ytlink" href="#" target="_blank" rel="noreferrer" title="open in your browser"></a>
+          <button class="ghost mini" id="copylink">Copy</button>
+          <label class="sm"><input type="checkbox" id="attime"> at current time</label>
+        </div>
+      </div>
+
+      <aside class="pside" id="queueside">
+        <div class="qhead"><span>Up next</span><span id="qmeta"></span></div>
+        <div id="qitems"></div>
+        <div id="qempty" class="meta">Play a playlist and the queue shows here.</div>
+      </aside>
     </div>
   </div>
 
@@ -225,11 +270,20 @@ function fmt(s){s=Math.max(0,Math.floor(s||0));const h=Math.floor(s/3600),
           : `${m}:${String(x).padStart(2,'0')}`;}
 function msg(t,cls){$('msg').innerHTML = t? `<div class="msg ${cls||''}">${t}</div>`:'';}
 
+const tmsg=(t,c)=>{ $('transmsg').innerHTML = t? `<div class="msg ${c||''}">${t}</div>`:''; };
+let WAITVID=null;                       // video we are waiting for the speaker to reach
+function showLoading(on){
+  if(on){ $('vidload').classList.remove('hide'); $('playerwrap').classList.add('hide');
+          $('noplayer').classList.add('hide'); }
+  else  { $('vidload').classList.add('hide'); }
+}
+
 function mountVideo(vid){
   if(!vid) return;
   if(!YT_READY){ PENDING_VID=vid; clog('mount deferred, api not ready: '+vid); return; }
   if(vid===CUR_VID && YT_PLAYER) return;
   CUR_VID=vid;
+  showLoading(false);
   $('playerwrap').classList.remove('hide'); $('noplayer').classList.add('hide');
   clog('mounting '+vid);
   try{
@@ -613,9 +667,9 @@ async function skip(dir){
   btn.disabled=true;
   try{
     const j=await api('/api/queue/'+(dir>0?'next':'prev'),{method:'POST'});
-    if(j.ended){ plmsg('end of playlist','ok'); setTimeout(()=>plmsg(''),2000); }
+    if(j.ended){ tmsg('end of playlist','ok'); setTimeout(()=>tmsg(''),2500); }
     else if(j.item){
-      SKIPHOLD=Date.now()+6000;          // stop stale polls repainting the old track
+      SKIPHOLD=Date.now()+15000;
       $('title').textContent=j.item.title||'';
       $('state').textContent='LOADING'; $('dot').className='dot buf';
       $('tcur').textContent='0:00';
@@ -623,9 +677,13 @@ async function skip(dir){
       DUR=j.item.duration||0; paintBar(0);
       $('recv').textContent=`${j.pos+1}/${j.total}`;
       if(typeof j.index==='number' && j.index!==NOWIDX){ NOWIDX=j.index; renderItems(); }
-      if(j.item.video_id){ mountVideo(j.item.video_id); updateLink(j.item.video_id,0); }
+      /* Mounting the new video now would leave it running against a speaker
+         still on the old track. Hold a spinner until the speaker catches up. */
+      WAITVID=j.item.video_id||null;
+      if($('showvid').checked) showLoading(true);
+      updateLink(WAITVID,0);
     }
-  }catch(e){ plmsg(e.message,'err'); }
+  }catch(e){ tmsg(e.message,'err'); setTimeout(()=>tmsg(''),3000); }
   btn.disabled=false;
 }
 $('prev').onclick=()=>skip(-1);
@@ -636,18 +694,57 @@ $('shuffle').onclick=async()=>{
   try{ await api('/api/queue/mode',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({shuffle:on})}); }catch(e){}
 };
-const RMODES=['off','all','one'], RLABEL={off:'↻',all:'↻ all',one:'↻ 1'};
-$('repeat').dataset.mode='off';
+const RMODES=['off','all','one'];
+function paintRepeat(m){
+  $('repeat').dataset.mode=m;
+  $('repeat').title='Repeat: '+m;
+  $('repeat').classList.toggle('on', m!=='off');
+  $('repeat').classList.toggle('one', m==='one');
+}
+paintRepeat('off');
 $('repeat').onclick=async()=>{
-  const cur=$('repeat').dataset.mode||'off';
-  const nx=RMODES[(RMODES.indexOf(cur)+1)%3];
-  $('repeat').dataset.mode=nx;
-  $('repeat').textContent=RLABEL[nx];
-  $('repeat').title='Repeat: '+nx;
-  $('repeat').classList.toggle('on', nx!=='off');
+  const nx=RMODES[(RMODES.indexOf($('repeat').dataset.mode||'off')+1)%3];
+  paintRepeat(nx);
   try{ await api('/api/queue/mode',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({repeat:nx})}); }catch(e){}
 };
+
+/* The "up next" panel mirrors the live queue. The playlist behind it is fetched
+   once per queue rather than shipped on every status poll. */
+let QPL=null;
+async function renderQueue(q){
+  if(!q){ $('qitems').innerHTML=''; $('qmeta').textContent='';
+          $('qempty').style.display=''; return; }
+  if(!QPL || QPL.id!==q.playlistId){
+    try{ QPL=(await api('/api/playlists')).playlists.find(p=>p.id===q.playlistId)||null; }
+    catch(e){ return; }
+  }
+  if(!QPL) return;
+  $('qempty').style.display='none';
+  $('qmeta').textContent=`${q.pos+1} / ${q.total}`;
+  const rows=q.order.map((itemIdx,n)=>{
+    const it=QPL.items[itemIdx]; if(!it) return '';
+    return `<div class="qi${n===q.pos?' now':''}" data-qpos="${n}">
+      <span class="qi-n">${n+1}</span>
+      <img class="qi-th" src="${esc(it.thumb||'')}" alt="" onerror="this.style.visibility='hidden'">
+      <span class="qi-t" title="${esc(it.title)}">${esc(it.title)}</span>
+      <span class="qi-d">${it.duration?fmt(it.duration):'·'}</span>
+    </div>`;
+  }).join('');
+  if(rows!==$('qitems').innerHTML){
+    $('qitems').innerHTML=rows;
+    const cur=$('qitems').querySelector('.qi.now');
+    if(cur) cur.scrollIntoView({block:'nearest'});
+  }
+}
+$('qitems').addEventListener('click', async e=>{
+  const row=e.target.closest('.qi'); if(!row||!QPL) return;
+  const qpos=+row.dataset.qpos;
+  try{ await api(`/api/playlists/${QPL.id}/play`,{method:'POST'.toString(),
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({index:qpos, shuffle:false, repeat:$('repeat').dataset.mode||'off'})});
+  }catch(err){ tmsg(err.message,'err'); }
+});
 
 async function tick(){
   try{
@@ -687,15 +784,22 @@ async function tick(){
         $('vol').value=Math.round(s.volume*100);
       updateLink(s.media && s.media.video_id, pos);
       const q=s.queue;
+      $('prev').disabled = !(q && q.can_prev);
+      $('next').disabled = !(q && q.can_next);
+      renderQueue(q);
+      if(WAITVID){
+        // only show the video once the speaker is actually on that track
+        if(s.media && s.media.video_id===WAITVID && s.state==='PLAYING'){
+          const v=WAITVID; WAITVID=null;
+          if($('showvid').checked) mountVideo(v); else showLoading(false);
+        }
+      }
       if(q){
         const idx=q.order[q.pos];
         if(CURPL && CURPL.id===q.playlistId && idx!==NOWIDX){ NOWIDX=idx; renderItems(); }
         $('recv').textContent=`${q.pos+1}/${q.total} · ${q.name}`.slice(0,30);
         if($('shuffle').classList.contains('on')!==q.shuffle) $('shuffle').classList.toggle('on',q.shuffle);
-        if(($('repeat').dataset.mode||'off')!==q.repeat){
-          $('repeat').dataset.mode=q.repeat; $('repeat').textContent=RLABEL[q.repeat];
-          $('repeat').classList.toggle('on', q.repeat!=='off');
-        }
+        if(($('repeat').dataset.mode||'off')!==q.repeat) paintRepeat(q.repeat);
       } else if(NOWIDX!==-1){ NOWIDX=-1; renderItems(); }
       if(s.media&&s.media.video_id&&$('showvid').checked) mountVideo(s.media.video_id);
       else if(s.media&&!s.media.video_id&&s.media.identified&&s.media.identified.confidence==='none')

@@ -555,7 +555,8 @@ app.get('/api/status', async (req, res) => {
       volume: vol == null ? null : +vol.toFixed(2), muted, rebuffers: S.rebuffers,
       media: S.media, auto_refreshes: S.refreshes,
       queue: S.queue ? { ...S.queue, total: S.queue.order.length,
-        item: queueItems()[S.queue.order[S.queue.pos]] || null } : null,
+        item: queueItems()[S.queue.order[S.queue.pos]] || null,
+        can_next: nextPos(1) >= 0, can_prev: nextPos(-1) >= 0 } : null,
       expires_in: S.expire ? Math.round(S.expire - Date.now() / 1000) : null });
   } catch (e) { res.json({ connected: true, error: String(e.message || e) }); }
 });
