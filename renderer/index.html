@@ -77,6 +77,8 @@ label.sm{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6
 .pli-b:hover{background:var(--bg);color:var(--ink)}
 .pgrid{display:grid;grid-template-columns:1fr;gap:16px}
 @media(min-width:860px){.pgrid{grid-template-columns:minmax(0,1fr) 280px}}
+body.noqueue .pside{display:none}
+@media(min-width:860px){body.noqueue .pgrid{grid-template-columns:minmax(0,1fr)}}
 .pside{display:flex;flex-direction:column;min-width:0;border-top:1px solid var(--line);padding-top:14px}
 @media(min-width:860px){.pside{border-top:0;border-left:1px solid var(--line);padding:0 0 0 16px}}
 .qhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;
@@ -201,7 +203,6 @@ button.mini.done{background:var(--ok)}
       <aside class="pside" id="queueside">
         <div class="qhead"><span>Up next</span><span id="qmeta"></span></div>
         <div id="qitems"></div>
-        <div id="qempty" class="meta">Play a playlist and the queue shows here.</div>
       </aside>
     </div>
   </div>
@@ -735,8 +736,10 @@ function highlightQueue(pos,total){
   if(total!=null) $('qmeta').textContent=`${pos+1} / ${total}`;
 }
 async function renderQueue(q){
-  if(!q){ QV=-1; QITEMS=[]; $('qitems').innerHTML=''; $('qmeta').textContent='';
-          $('qempty').style.display=''; return; }
+  /* the panel only earns its space when something is actually queued behind
+     the current track */
+  document.body.classList.toggle('noqueue', !(q && q.total > 1));
+  if(!q || q.total<2){ QV=-1; QITEMS=[]; $('qitems').innerHTML=''; $('qmeta').textContent=''; return; }
   if(q.version!==QV){
     try{ const j=await api('/api/queue');
       if(j && j.items){ QITEMS=j.items; QV=q.version;
@@ -748,7 +751,6 @@ async function renderQueue(q){
       }
     }catch(e){ return; }
   }
-  $('qempty').style.display='none';
   highlightQueue(q.pos,q.total);
 }
 $('qitems').addEventListener('click', async e=>{
