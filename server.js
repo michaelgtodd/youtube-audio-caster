@@ -138,8 +138,11 @@ function addService(svc) {
   const host = (svc.addresses || []).find(a => /^\d+\.\d+\.\d+\.\d+$/.test(a)) || svc.host;
   if (!name || !host) return;
   const ca = parseInt(txt.ca || '0', 10);
-  DEV.set(name, { name, model: txt.md || '?', host, port: svc.port || 8009,
-    audio_only: !(ca & 1), seen: Date.now() });   // ca bit 0 = VIDEO_OUT
+  const port = svc.port || 8009;
+  DEV.set(name, { name, model: txt.md || '?', host, port,
+    audio_only: !(ca & 1),
+    is_group: /group/i.test(txt.md || '') || port !== 8009,
+    seen: Date.now() });   // ca bit 0 = VIDEO_OUT
 }
 
 function deviceList() {
@@ -176,11 +179,14 @@ async function discover(ms = 9000, want = null) {
 }
 
 /* ---------- cast plumbing ---------- */
-const pconnect = host => new Promise((res, rej) => {
+const pconnect = (host, port) => new Promise((res, rej) => {
   const c = new Client();
   const onErr = e => rej(e);
   c.once('error', onErr);
-  c.connect(host, () => { c.removeListener('error', onErr);
+  // Cast groups do NOT listen on 8009 - they advertise a random high port, and
+  // connecting to 8009 on that host reaches the individual speaker instead.
+  c.connect({ host, port: port || 8009 }, () => {
+    c.removeListener('error', onErr);
     c.on('error', e => logErr('client: ' + e)); res(c); });
 });
 const p = (obj, fn, ...a) => new Promise((res, rej) =>
@@ -198,9 +204,9 @@ async function connectDevice(name) {
   if (!dev) throw new Error(`device ${name} not found`);
   await teardown();
   let client;
-  try { client = await pconnect(dev.host); }
-  catch (e) { console.log(`[connect] FAILED ${dev.host}: ${e && e.message}`); throw e; }
-  console.log(`[connect] tls up to ${dev.host}`);
+  try { client = await pconnect(dev.host, dev.port); }
+  catch (e) { console.log(`[connect] FAILED ${dev.host}:${dev.port}: ${e && e.message}`); throw e; }
+  console.log(`[connect] tls up to ${dev.host}:${dev.port}${dev.is_group ? ' (group)' : ''}`);
   S.client = client; S.device = name; S.host = dev.host;
   saveSettings({ ...loadSettings(), lastDevice: name });
   return { client, dev };
@@ -408,7 +414,7 @@ async function applyMedia(m, pageUrl) {
   return S.media;
 }
 
-async function playQueuePos(pos) {
+async function playQueuePos(pos, token) {
   const items = queueItems();
   const it = items[S.queue.order[pos]];
   if (!it) return false;
@@ -417,6 +423,8 @@ async function playQueuePos(pos) {
   try {
     const pre = S.prefetch && S.prefetch.video_id === it.video_id ? S.prefetch : null;
     S.prefetch = null;
+    // a newer skip may have landed while this one was resolving
+    if (token && token !== advanceToken) { console.log('[queue] superseded'); return false; }
     if (S.player && pre) { console.log('[queue] using prefetched stream'); await applyMedia(pre.m, pre.pageUrl); }
     else if (S.player) await loadMedia(it.url);
     else await castUrl(it.url, S.device);
@@ -440,11 +448,12 @@ async function startQueue(playlistId, startIndex = 0, opts = {}) {
   return S.queue;
 }
 
+let advanceToken = 0;
 async function advance(dir) {
   if (!S.queue) return false;
   const np = nextPos(dir);
   if (np < 0) { console.log('[queue] end of playlist'); S.queue = null; return false; }
-  return playQueuePos(np);
+  return playQueuePos(np, ++advanceToken);
 }
 
 /* End-of-track detection is event driven. Polling getStatus() does not work:
@@ -502,7 +511,7 @@ app.use(express.static(path.join(__dirname, 'renderer')));
 app.get('/api/devices', async (req, res) => {
   try {
     const want = loadSettings().lastDevice || null;
-    if (req.query.refresh === '1') await discover(9000, want);
+    if (req.query.refresh === '1') await discover(15000, want);
     else if (!DEV.size || (want && !DEV.has(want))) await discover(12000, want);
     res.json({ devices: deviceList(), connected: S.device, preferred: want });
   } catch (e) { logErr(e); res.status(500).json({ error: String(e) }); }
@@ -624,10 +633,21 @@ app.post('/api/playlists/:id/play', asyncRoute(async (req, res) => {
   res.json({ ok: true, queue: q });
 }));
 
-app.post('/api/queue/next', asyncRoute(async (req, res) =>
-  res.json({ ok: await advance(1) })));
-app.post('/api/queue/prev', asyncRoute(async (req, res) =>
-  res.json({ ok: await advance(-1) })));
+/* Respond with the target track straight away so the UI can show the change
+   immediately; loading it on the speaker takes seconds and happens after. */
+function skip(dir, res) {
+  if (!S.queue) return res.status(400).json({ error: 'nothing queued' });
+  const np = nextPos(dir);
+  if (np < 0) { S.queue = null; return res.json({ ok: false, ended: true }); }
+  const index = S.queue.order[np];
+  const item = queueItems()[index] || null;
+  S.queue.pos = np;
+  const token = ++advanceToken;
+  res.json({ ok: true, pos: np, index, total: S.queue.order.length, item });
+  playQueuePos(np, token).catch(e => logErr('skip: ' + e.message));
+}
+app.post('/api/queue/next', (req, res) => skip(1, res));
+app.post('/api/queue/prev', (req, res) => skip(-1, res));
 app.post('/api/queue/stop', (req, res) => { S.queue = null; res.json({ ok: true }); });
 
 app.post('/api/queue/mode', (req, res) => {

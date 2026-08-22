@@ -245,13 +245,32 @@ function mountVideo(vid){
 async function api(p,o){const r=await fetch(p,o);let j={};try{j=await r.json()}catch(e){}
   if(!r.ok) throw new Error(j.error||('HTTP '+r.status)); return j;}
 
+const deviceOptions = ds => ds.map(d=>
+  `<option value="${esc(d.name)}">${esc(d.name)}${d.is_group?' — group':(d.audio_only?' — speaker':'')}</option>`).join('');
+
+/* The window is hidden rather than destroyed when toggled from the tray, so the
+   page can live for hours without reloading. Re-sync the device list on a timer
+   or a speaker that answers mDNS late never shows up at all. */
+async function syncDevices(){
+  try{
+    const j=await api('/api/devices');
+    const html=deviceOptions(j.devices);
+    if(html && html!==$('device').innerHTML){
+      const keep=$('device').value;
+      $('device').innerHTML=html;
+      if(keep && j.devices.some(d=>d.name===keep)) $('device').value=keep;
+      else if(j.connected) $('device').value=j.connected;
+      clog('device list updated ('+j.devices.length+')');
+    }
+  }catch(e){}
+}
+setInterval(syncDevices, 20000);
+
 async function loadDevices(refresh){
   $('device').innerHTML='<option>scanning…</option>';
   try{
     const j=await api('/api/devices'+(refresh?'?refresh=1':''));
-    $('device').innerHTML = j.devices.map(d=>
-      `<option value="${d.name}">${d.name}${d.audio_only?' — speaker':''}</option>`).join('')
-      || '<option value="">none found</option>';
+    $('device').innerHTML = deviceOptions(j.devices) || '<option value="">none found</option>';
     const pref = j.connected || j.preferred;
     const have = pref && [...$('device').options].some(o=>o.value===pref);
     if(have) $('device').value=pref;
@@ -585,8 +604,32 @@ $('plitems').addEventListener('drop',async e=>{
 });
 
 /* transport */
-$('prev').onclick=()=>api('/api/queue/prev',{method:'POST'}).catch(e=>plmsg(e.message,'err'));
-$('next').onclick=()=>api('/api/queue/next',{method:'POST'}).catch(e=>plmsg(e.message,'err'));
+/* The server answers with the target track immediately and loads it on the
+   speaker afterwards, so the UI can show the change at once instead of waiting
+   several seconds for the next status poll. */
+let SKIPHOLD=0;
+async function skip(dir){
+  const btn = dir>0 ? $('next') : $('prev');
+  btn.disabled=true;
+  try{
+    const j=await api('/api/queue/'+(dir>0?'next':'prev'),{method:'POST'});
+    if(j.ended){ plmsg('end of playlist','ok'); setTimeout(()=>plmsg(''),2000); }
+    else if(j.item){
+      SKIPHOLD=Date.now()+6000;          // stop stale polls repainting the old track
+      $('title').textContent=j.item.title||'';
+      $('state').textContent='LOADING'; $('dot').className='dot buf';
+      $('tcur').textContent='0:00';
+      $('tdur').textContent=j.item.duration?fmt(j.item.duration):'0:00';
+      DUR=j.item.duration||0; paintBar(0);
+      $('recv').textContent=`${j.pos+1}/${j.total}`;
+      if(typeof j.index==='number' && j.index!==NOWIDX){ NOWIDX=j.index; renderItems(); }
+      if(j.item.video_id){ mountVideo(j.item.video_id); updateLink(j.item.video_id,0); }
+    }
+  }catch(e){ plmsg(e.message,'err'); }
+  btn.disabled=false;
+}
+$('prev').onclick=()=>skip(-1);
+$('next').onclick=()=>skip(1);
 $('shuffle').onclick=async()=>{
   const on=!$('shuffle').classList.contains('on');
   $('shuffle').classList.toggle('on',on);
@@ -617,6 +660,15 @@ async function tick(){
       if(s.media) $('codec').textContent=`${s.media.acodec||'?'} ${s.media.abr?Math.round(s.media.abr)+'k':''}`;
       if(s.media&&s.media.title) $('title').textContent=s.media.title;
       const pos=s.position||0, dur=s.duration||0;
+      if(SKIPHOLD && Date.now()<SKIPHOLD){
+        // a skip is in flight: only let the poll through once the speaker has
+        // actually moved to the new track
+        if(!(s.media && NOWIDX>=0 && CURPL && CURPL.items[NOWIDX]
+             && s.media.video_id===CURPL.items[NOWIDX].video_id)){
+          setTimeout(tick,1000); return;
+        }
+        SKIPHOLD=0;
+      }
       DUR=dur;
       bar().classList.toggle('disabled', !dur);
       $('tdur').textContent=fmt(dur);

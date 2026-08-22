@@ -159,6 +159,13 @@ The server binds to a random loopback port inside the app. Discovery is a
 **persistent** mDNS browser rather than one-shot queries — Cast devices answer at
 their own pace, and a short window silently under-reports on a busy network.
 
+## Speaker groups
+
+Cast groups work as targets and are labelled "group" in the picker. They do **not**
+listen on 8009 - a group advertises a random high port, and connecting to 8009 on
+that host silently reaches one member speaker instead of the group. The advertised
+port is used.
+
 ## Limitations
 
 - **YouTube only** — relies on yt-dlp's extractor
