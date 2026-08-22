@@ -38,12 +38,18 @@ async function showWindow() {
 
   /* A dock-hidden app gets no application menu, so it gets no menu-driven
      shortcuts either - fullscreen had no way out. Bind the keys directly. */
+  let htmlFs = false;
+  win.on('enter-html-full-screen', () => { htmlFs = true; });
+  win.on('leave-html-full-screen', () => { htmlFs = false; });
+
   win.webContents.on('before-input-event', (e, input) => {
     if (input.type !== 'keyDown') return;
     const cmd = input.meta || input.control;
     const key = (input.key || '').toLowerCase();
-    if (key === 'f11') { win.setFullScreen(!win.isFullScreen()); e.preventDefault(); }
-    else if (key === 'escape' && win.isFullScreen()) { win.setFullScreen(false); e.preventDefault(); }
+    if (key === 'f11' && !htmlFs) { win.setFullScreen(!win.isFullScreen()); e.preventDefault(); }
+    else if (key === 'escape' && win.isFullScreen() && !htmlFs) {
+      win.setFullScreen(false); e.preventDefault();   // element fullscreen exits itself
+    }
     else if (cmd && key === 'w') { win.close(); e.preventDefault(); }
     else if (cmd && key === 'q') { app.isQuitting = true; app.quit(); e.preventDefault(); }
     else if (cmd && key === 'r') { win.reload(); e.preventDefault(); }

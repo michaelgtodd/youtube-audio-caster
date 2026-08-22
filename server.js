@@ -13,6 +13,9 @@ const DMR_APP_ID = 'CC1AD845';
 const YTDLP = process.env.YTDLP || path.join(__dirname, 'bin', 'yt-dlp');
 const DATA_DIR = process.env.CASTAUDIO_DATA || __dirname;
 const SESSIONS = path.join(DATA_DIR, 'sessions.json');
+const SETTINGS = path.join(DATA_DIR, 'settings.json');
+const loadSettings = () => { try { return JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); } catch { return {}; } };
+const saveSettings = o => { try { fs.writeFileSync(SETTINGS, JSON.stringify(o, null, 1)); } catch (e) { logErr(e); } };
 
 const S = {
   devices: [], client: null, player: null, device: null, host: null,
@@ -130,10 +133,11 @@ async function discover(ms = 9000) {
   startDiscovery();
   try { browserInst.update(); } catch {}
   const deadline = Date.now() + ms;
+  const floor = Date.now() + 3500;      // never settle on a barely-populated list
   let last = -1, stable = 0;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 700));
-    if (DEV.size === last) { if (++stable >= 4 && DEV.size > 0) break; }
+    if (DEV.size === last) { if (++stable >= 5 && DEV.size > 0 && Date.now() > floor) break; }
     else { stable = 0; last = DEV.size; }
   }
   return deviceList();
@@ -156,12 +160,17 @@ async function teardown() {
 }
 
 async function connectDevice(name) {
+  console.log(`[connect] ${name}`);
   let dev = DEV.get(name);
   if (!dev) dev = (await discover(9000)).find(d => d.name === name);
   if (!dev) throw new Error(`device ${name} not found`);
   await teardown();
-  const client = await pconnect(dev.host);
+  let client;
+  try { client = await pconnect(dev.host); }
+  catch (e) { console.log(`[connect] FAILED ${dev.host}: ${e && e.message}`); throw e; }
+  console.log(`[connect] tls up to ${dev.host}`);
   S.client = client; S.device = name; S.host = dev.host;
+  saveSettings({ ...loadSettings(), lastDevice: name });
   return { client, dev };
 }
 
@@ -173,7 +182,8 @@ async function attach(name) {
   // receiver status has populated - same race as getStatus() after join().
   let sessions = [], live = null;
   for (let i = 0; i < 8; i++) {
-    try { sessions = (await p(client, 'getSessions')) || []; } catch { sessions = []; }
+    try { sessions = (await p(client, 'getSessions')) || []; }
+    catch (err) { sessions = []; if (i === 0) console.log('[attach] getSessions threw:', err && err.message); }
     live = sessions.find(x => x.appId === DMR_APP_ID);
     if (live) break;
     await new Promise(r => setTimeout(r, 400));
@@ -287,7 +297,8 @@ app.get('/api/devices', async (req, res) => {
   try {
     if (req.query.refresh === '1') await discover(9000);
     else if (!DEV.size) await discover(9000);
-    res.json({ devices: deviceList(), connected: S.device });
+    res.json({ devices: deviceList(), connected: S.device,
+               preferred: loadSettings().lastDevice || null });
   } catch (e) { logErr(e); res.status(500).json({ error: String(e) }); }
 });
 
