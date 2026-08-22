@@ -379,8 +379,35 @@ async function insertBatched(items) {
 /* Extraction costs ~8s a video, so a long playlist cannot be resolved up front.
    Load a few, start playing, then fill the rest in the background - once the
    fill completes the speaker holds the whole queue and needs nothing from us. */
+/* queueInsert needs a live media session - there is no mediaSessionId until
+   something has been loaded - so adding to an idle speaker has to start the
+   queue rather than append to it. */
+/* Ask the receiver whether a media session is actually live. The cache can be
+   stale - a queue that finished ends the session, and queueInsert then fails
+   with INVALID_MEDIA_SESSION_ID - and getStatus also refreshes the controller's
+   own mediaSessionId, which insert depends on. */
+async function queueIsLive() {
+  if (!S.player) return false;
+  try {
+    const st = await p(S.player, 'getStatus');
+    return !!(st && st.mediaSessionId && st.playerState && st.playerState !== 'IDLE');
+  } catch { return false; }
+}
+
+async function ensurePlayer() {
+  if (S.player) return S.player;
+  if (!S.client) throw new Error('no device connected');
+  const sessions = await p(S.client, 'getSessions').catch(() => []);
+  for (const sess of sessions || []) {
+    if (sess.appId !== DMR_APP_ID) { try { await p(S.client, 'stop', sess); } catch {} }
+  }
+  console.log('[queue] launching the media receiver to hold a queue');
+  S.player = await p(S.client, 'launch', DefaultMediaReceiver);
+  return S.player;
+}
+
 async function loadQueue(entries, startIndex, opts) {
-  if (!S.player) throw new Error('no device connected');
+  await ensurePlayer();
   const ordered = entries.slice(startIndex).concat(entries.slice(0, startIndex));
   const head = [];
   for (const e of ordered.slice(0, CQ.HEAD)) head.push(await asCastItem(e));
@@ -618,7 +645,7 @@ const shuffledCopy = arr => { const a = [...arr];
 /* The receiver owns position, so skipping is a jump instruction to it rather
    than a track we pick and load ourselves. */
 async function skip(dir, res) {
-  if (!S.player) return res.status(400).json({ error: 'not connected' });
+  if (!S.player || !S.qcache) return res.status(400).json({ error: 'nothing queued' });
   try {
     await p(S.player, 'queueUpdate', [], { jump: dir });
     const q = await syncQueue();
@@ -669,7 +696,7 @@ app.get('/api/queue', asyncRoute(async (req, res) => {
 
 /* append to what is playing: a video url, a playlist url, or a saved playlist */
 app.post('/api/queue/add', asyncRoute(async (req, res) => {
-  if (!S.player) return res.status(400).json({ error: 'not connected' });
+  if (!S.client) return res.status(400).json({ error: 'not connected' });
   const { url, playlistId } = req.body || {};
   let entries;
   if (playlistId) {
@@ -681,8 +708,14 @@ app.post('/api/queue/add', asyncRoute(async (req, res) => {
   } else return res.status(400).json({ error: 'no url' });
   if (!entries.length) return res.status(400).json({ error: 'nothing found at that url' });
 
-  res.json({ ok: true, added: entries.length });    // answer now, push in the background
+  const live = await queueIsLive();
+  res.json({ ok: true, added: entries.length, started: !live });
   (async () => {
+    if (!live) {                         // nothing playing: this becomes the queue
+      await loadQueue(entries, 0, { repeat: 'off' });
+      await syncQueue();
+      return;
+    }
     const buf = [];
     for (const e of entries) {
       try { buf.push(await asCastItem(e)); } catch (err) { logErr('queue add: ' + err.message); }
@@ -691,7 +724,12 @@ app.post('/api/queue/add', asyncRoute(async (req, res) => {
     if (buf.length) await insertBatched(buf);
     await syncQueue();
     console.log(`[queue] appended ${entries.length}`);
-  })().catch(e => logErr('queue add: ' + e.message));
+  })().catch(async e => {
+    logErr('queue add: ' + e.message);
+    if (/MEDIA_SESSION/i.test(e.message)) {     // session died mid-append
+      try { await loadQueue(entries, 0, { repeat: 'off' }); await syncQueue(); } catch {}
+    }
+  });
 }));
 
 app.get('/api/errors', (req, res) => res.json({ errors: S.errors.slice(-10) }));
