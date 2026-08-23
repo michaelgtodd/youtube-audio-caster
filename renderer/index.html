@@ -371,6 +371,7 @@ async function loadDevices(refresh){
       $('noplayer').textContent='No speakers found yet.';
       return;
     }
+    if(!j.devices.length){ await explainNoSpeakers(); return; }
     /* Attach to whatever is actually playing rather than to a remembered choice.
        mDNS reports which speakers are busy, so this needs nothing stored. */
     const pick = j.connected || j.active;
@@ -382,6 +383,24 @@ async function loadDevices(refresh){
     else { msg('');
            $('noplayer').textContent='Pick a speaker above, then cast a link or play a playlist.'; }
   }catch(e){ $('device').innerHTML='<option value="">scan failed</option>'; msg(e.message,'err'); }
+}
+
+/* "No speakers found" is useless on its own. Show what was actually tried, so a
+   report comes with facts rather than a symptom. */
+async function explainNoSpeakers(){
+  let d=null;
+  try{ d=await api('/api/diagnostics'); }catch(e){}
+  const rows = d ? (d.discovery.interfaces||[]).map(i=>
+    `${esc(i.label)} — ${i.ok?'listening':'failed: '+esc(i.error||'')}`).join('<br>') : '';
+  msg(`<b>No speakers found on this network.</b><br>
+    Cast devices are found over mDNS (UDP port 5353). Things worth checking:<br>
+    • this computer is on the <b>same network</b> as the speakers, not a guest network or VPN<br>
+    • the app is allowed through the firewall for <b>both private and public</b> networks<br>
+    • the speakers are powered on<br>
+    ${rows?`<br><span style="opacity:.75">Searching on:<br>${rows}</span>`:''}
+    ${d?`<br><span style="opacity:.75">${esc(d.platform)} · ${(d.interfaces||[]).length} network interface(s)</span>`:''}
+    <br><br>Press ⟳ to search again.`,'err');
+  $('noplayer').textContent='No speakers found. See the message above.';
 }
 
 async function attach(){

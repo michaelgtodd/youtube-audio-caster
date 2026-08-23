@@ -104,7 +104,7 @@ async function identify(title, duration) {
 /* A persistent browser beats one-shot queries: Cast devices answer at their own
    pace, and a short window silently under-reports on a busy network. */
 const DEV = new Map();
-let bonjourInst = null, browserInst = null, settledOnce = false;
+let settledOnce = false;
 S.discoveryError = null;
 
 function addService(svc) {
@@ -131,21 +131,54 @@ function deviceList() {
   return S.devices;
 }
 
+/* Browse on EVERY external IPv4 interface, not whichever one the library picks.
+   Windows machines routinely carry Hyper-V, WSL, VirtualBox and VPN adapters,
+   and binding mDNS to one of those finds nothing at all while looking perfectly
+   healthy. Macs hit the same thing with VPN tunnels. */
+const os = require('os');
+const externalIPv4 = () => Object.entries(os.networkInterfaces()).flatMap(
+  ([name, addrs]) => (addrs || [])
+    .filter(a => a.family === 'IPv4' && !a.internal)
+    .map(a => ({ name, address: a.address })));
+
+let browsers = [];            // one per interface
+S.discovery = { started: false, interfaces: [], error: null };
+
 function startDiscovery() {
-  if (browserInst) return;
-  try {
-    bonjourInst = new Bonjour();
-    browserInst = bonjourInst.find({ type: 'googlecast' }, addService);
-    browserInst.on && browserInst.on('up', addService);
-    if (bonjourInst.on) bonjourInst.on('error', e => logErr('mdns: ' + e.message));
-    setInterval(() => { try { browserInst.update(); } catch {} }, 20000).unref();
-    console.log('[discovery] persistent mDNS browser started');
-  } catch (e) {
-    browserInst = null; bonjourInst = null;
-    S.discoveryError = e.message;
-    logErr('discovery could not start: ' + e.message);
-    throw e;
+  if (browsers.length) return;
+  const ifaces = externalIPv4();
+  S.discovery.interfaces = [];
+
+  const spin = (label, opts) => {
+    try {
+      const b = new Bonjour(opts);
+      const br = b.find({ type: 'googlecast' }, addService);
+      if (br.on) br.on('up', addService);
+      browsers.push({ label, bonjour: b, browser: br });
+      S.discovery.interfaces.push({ label, ok: true });
+      return true;
+    } catch (e) {
+      S.discovery.interfaces.push({ label, ok: false, error: e.message });
+      logErr(`mdns on ${label}: ${e.message}`);
+      return false;
+    }
+  };
+
+  /* The default browser is the one that actually works - binding to a specific
+     interface found nothing at all on macOS. Start it first and always keep it;
+     the per-interface browsers are an ADDITION for machines where the default
+     picks a virtual adapter (Hyper-V, WSL, VPN) and sees nothing. */
+  spin('default', undefined);
+  for (const i of ifaces) spin(`${i.name} ${i.address}`, { interface: i.address });
+  if (!browsers.length) {
+    S.discovery.error = 'could not open mDNS on any interface';
+    S.discoveryError = S.discovery.error;
+    throw new Error(S.discovery.error);
   }
+  S.discovery.started = true;
+  setInterval(() => { for (const b of browsers) { try { b.browser.update(); } catch {} } }, 20000).unref();
+  console.log(`[discovery] browsing on ${browsers.length} interface(s): `
+    + browsers.map(b => b.label).join(', '));
 }
 
 /* Wait until the device set stops growing. If `want` is given, do not settle
@@ -153,9 +186,9 @@ function startDiscovery() {
    returning a partial list means the caller silently misses a speaker. */
 async function discover(ms = 9000, want = null) {
   // must not throw: the caller needs to reach the "discovery is blocked" reply
-  try { startDiscovery(); } catch { /* recorded in S.discoveryError */ }
-  if (!browserInst) return deviceList();
-  try { browserInst.update(); } catch {}
+  try { startDiscovery(); } catch { /* recorded in S.discovery.error */ }
+  if (!browsers.length) return deviceList();
+  for (const b of browsers) { try { b.browser.update(); } catch {} }
   const deadline = Date.now() + ms;
   const floor = Date.now() + 3500;
   let last = -1, stable = 0;
@@ -799,6 +832,16 @@ app.post('/api/queue/add', asyncRoute(async (req, res) => {
       try { await loadQueue(entries, 0, { repeat: 'off' }); await syncQueue(); } catch {}
     }
   });
+}));
+
+app.get('/api/diagnostics', (req, res) => res.json({
+  platform: process.platform, arch: process.arch,
+  discovery: S.discovery,
+  interfaces: externalIPv4(),
+  devices_found: DEV.size,
+  device_names: [...DEV.keys()],
+  connected: S.device,
+  recent_errors: S.errors.slice(-5),
 }));
 
 app.get('/api/errors', (req, res) => res.json({ errors: S.errors.slice(-10) }));
