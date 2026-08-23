@@ -1,7 +1,7 @@
 {
   "name": "youtube-audio-caster",
   "version": "1.2.1",
-  "description": "Cast a YouTube video's audio to an audio-only Google speaker as a native buffered stream instead of fragile screen mirroring",
+  "description": "Play a YouTube video's audio on Google Cast and Sonos speakers as a native buffered stream instead of fragile screen mirroring",
   "main": "main.js",
   "scripts": {
     "test": "node --test test/*.test.js",
@@ -18,6 +18,7 @@
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {
+    "@svrooij/sonos": "2.7.0-beta.4",
     "bonjour-service": "^1.4.4",
     "castv2-client": "^1.2.0",
     "express": "^5.2.1"

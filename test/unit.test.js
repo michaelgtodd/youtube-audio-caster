@@ -8,6 +8,7 @@ const os = require('os'), fs = require('fs'), path = require('path');
 const PL = require('../playlists.js');
 const CQ = require('../castqueue.js');
 const ID = require('../identity.js');
+const SO = require('../sonos.js');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'yac-test-'));
 
@@ -299,4 +300,88 @@ test('playing and paused both count as occupied', () => {
   // a paused speaker is still someone's speaker - do not offer it as free
   assert.strictEqual(GRP.playingFromMediaStatus(
     [{ playerState: 'PAUSED', media: { contentId: 'x' } }]), true);
+});
+
+test('Sonos queue metadata preserves title, format, duration and video identity', () => {
+  const item = SO.mediaItem({
+    url: 'https://rr.googlevideo.com/play?x=1&y=2', ctype: 'audio/mp4',
+    title: 'Cats & Dogs <live>', duration: 3661, video_id: 'I5noeDaJaFQ',
+    thumb: 'https://i.ytimg.com/vi/I5noeDaJaFQ/maxresdefault.jpg',
+  }, { video_id: 'I5noeDaJaFQ' });
+  assert.strictEqual(item.uri, 'https://rr.googlevideo.com/play?x=1&y=2');
+  assert.match(item.metadata, /&lt;DIDL-Lite/);
+  assert.match(item.metadata, /youtube:I5noeDaJaFQ/);
+  assert.match(item.metadata, /Cats &amp;amp; Dogs &amp;lt;live&amp;gt;/);
+  assert.match(item.metadata, /protocolInfo=&quot;http-get:\*:audio\/mp4:\*&quot;/);
+  assert.match(item.metadata, /duration=&quot;01:01:01&quot;/);
+  assert.match(item.metadata, /\/vi\/I5noeDaJaFQ\//);
+  assert.match(item.metadata, /x=1&amp;amp;y=2/);
+});
+
+test('Sonos queue SOAP inputs escape CDN query strings exactly once', async () => {
+  let sent = null;
+  const service = { AddURIToQueue: async input => { sent = input; return { FirstTrackNumberEnqueued: 1 }; } };
+  const controller = new SO.SonosController({ Coordinator: null, AVTransportService: service });
+  const item = SO.mediaItem({ url: 'https://cdn/play?x=1&y=2', title: 'A & B',
+    ctype: 'audio/mp4', video_id: 'I5noeDaJaFQ' }, { video_id: 'I5noeDaJaFQ' });
+  await controller.queue(item);
+  assert.strictEqual(sent.EnqueuedURI, 'https://cdn/play?x=1&amp;y=2');
+  assert.strictEqual(sent.EnqueueAsNext, false);
+  assert.match(sent.EnqueuedURIMetaData, /A &amp;amp; B/);
+  assert.match(sent.EnqueuedURIMetaData, /https:\/\/cdn\/play\?x=1&amp;amp;y=2/);
+  const device = new (require('@svrooij/sonos').SonosDevice)('127.0.0.1');
+  const body = device.AVTransportService.generateRequestBody('AddURIToQueue', sent);
+  assert.match(body, /<EnqueuedURI>https:\/\/cdn\/play\?x=1&amp;y=2<\/EnqueuedURI>/);
+  assert.match(body, /<EnqueuedURIMetaData>&lt;DIDL-Lite/);
+  assert.match(body, /&lt;res protocolInfo=/);
+});
+
+test('Sonos groups become one stable coordinator target', () => {
+  const groups = SO.normalizeGroups([{
+    Coordinator: 'RINCON_COORD01400', Name: 'Living Room + 1',
+    ZoneGroupMember: [
+      { UUID: 'RINCON_COORD01400', ZoneName: 'Living Room',
+        Location: 'http://10.0.0.8:1400/xml/device_description.xml' },
+      { UUID: 'RINCON_OTHER01400', ZoneName: 'Kitchen',
+        Location: 'http://10.0.0.9:1400/xml/device_description.xml' },
+    ],
+  }]);
+  assert.strictEqual(groups.length, 1);
+  assert.strictEqual(groups[0].key, 'sonos:RINCON_COORD01400');
+  assert.strictEqual(groups[0].host, '10.0.0.8');
+  assert.strictEqual(groups[0].name, 'Living Room + 1');
+  assert.deepStrictEqual(groups[0].group_members, ['Living Room', 'Kitchen']);
+  assert.strictEqual(groups[0].is_group, true);
+});
+
+test('Sonos queue identity survives through album art or the session store', () => {
+  const fromArt = SO.describeQueueItem({
+    uri: 'https://cdn/x?expire=1787464000', title: 'Track',
+    albumArtURI: 'https://i.ytimg.com/vi/I5noeDaJaFQ/mqdefault.jpg',
+  }, 2);
+  assert.strictEqual(fromArt.itemId, 3);
+  assert.strictEqual(fromArt.video_id, 'I5noeDaJaFQ');
+  assert.strictEqual(fromArt.url, 'https://www.youtube.com/watch?v=I5noeDaJaFQ');
+  assert.strictEqual(fromArt.expires, 1787464000);
+
+  const recalled = SO.describeQueueItem({ uri: 'opaque', title: 'Stored' }, 0, () => ({
+    video_id: 'aaaaaaaaaaa', src_url: 'https://youtu.be/aaaaaaaaaaa', duration: 42,
+  }));
+  assert.strictEqual(recalled.video_id, 'aaaaaaaaaaa');
+  assert.strictEqual(recalled.url, 'https://youtu.be/aaaaaaaaaaa');
+  assert.strictEqual(recalled.duration, 42);
+
+  const owned = SO.describeQueueItem({ uri: 'u', itemId: 'youtube-queue:aaaaaaaaaaa' }, 0);
+  assert.strictEqual(owned.queue_owned, true);
+});
+
+test('Sonos repeat modes normalize to the existing API contract', () => {
+  assert.strictEqual(SO.REPEAT_TO_SONOS.off, 'NORMAL');
+  assert.strictEqual(SO.REPEAT_TO_SONOS.all, 'REPEAT_ALL');
+  assert.strictEqual(SO.REPEAT_TO_SONOS.one, 'REPEAT_ONE');
+  assert.strictEqual(SO.repeatFromSonos('SHUFFLE'), 'all');
+  assert.strictEqual(SO.repeatFromSonos('SHUFFLE_NOREPEAT'), 'off');
+  assert.strictEqual(SO.playModeFor('one', true), 'SHUFFLE_REPEAT_ONE');
+  assert.strictEqual(SO.playModeFor('all', true), 'SHUFFLE');
+  assert.strictEqual(SO.playModeFor('off', false), 'NORMAL');
 });

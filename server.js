@@ -13,6 +13,7 @@ const PL = require('./playlists.js');
 const CQ = require('./castqueue.js');
 const ID = require('./identity.js');
 const GRP = require('./castgroups.js');
+const SO = require('./sonos.js');
 const { videoIdOf, isPlaylistUrl, cdnToken, expiryOf, remember, recall } = ID;
 
 const DMR_APP_ID = 'CC1AD845';
@@ -23,9 +24,11 @@ PL.init(DATA_DIR);
 
 const S = {
   devices: [], client: null, player: null, device: null, host: null,
+  deviceName: null, protocol: null, sonos: null, sonosGroup: null,
   media: null, srcUrl: null, rebuffers: 0, lastState: null,
   expire: null, cdnUrl: null, refreshes: 0, lastRefresh: 0, errors: [],
   queue: null,          // {playlistId, name, order:[itemIdx], pos, repeat, shuffle}
+  queueActive: false,
 };
 const logErr = m => { S.errors.push({ t: Date.now(), msg: String(m).slice(0, 400) });
   S.errors = S.errors.slice(-25); console.error('[err]', String(m).slice(0, 300)); };
@@ -102,6 +105,7 @@ async function identify(title, duration) {
 /* A persistent browser beats one-shot queries: Cast devices answer at their own
    pace, and a short window silently under-reports on a busy network. */
 const DEV = new Map();
+const SONOS = new SO.SonosManager();
 let settledOnce = false;
 S.discoveryError = null;
 
@@ -112,10 +116,12 @@ function addService(svc) {
   if (!name || !host) return;
   const ca = parseInt(txt.ca || '0', 10);
   const port = svc.port || 8009;
+  const key = `cast:${txt.id || name}`;
   /* st=1 means the device has something loaded and rs is what it is, both
      straight from mDNS - so "which speaker is playing" needs no connection and
      no remembered preference. */
-  DEV.set(name, { name, id: txt.id || null, model: txt.md || '?', host, port,
+  DEV.set(key, { key, name, id: txt.id || null, model: txt.md || '?', host, port,
+    protocol: 'cast',
     audio_only: !(ca & 1),                    // ca bit 0 = VIDEO_OUT
     is_group: /group/i.test(txt.md || '') || port !== 8009,
     busy: String(txt.st || '0') === '1',
@@ -137,13 +143,13 @@ async function groupPlayback(devices) {
      group that had long since gone quiet. The group's own answer says whether
      it is playing, so ask it and believe that instead. Groups are few and the
      result is cached, so this costs little. */
-  const groups = devices.filter(d => d.is_group);
+  const groups = devices.filter(d => d.protocol === 'cast' && d.is_group);
   let inGroup = new Map();
   const groupPlaying = new Map();
   if (groups.length) {
     const reports = await Promise.all(groups.map(async g => {
       const r = await GRP.readMembers(g.host, g.port);
-      if (r.ok) groupPlaying.set(g.name, r.playing);
+      if (r.ok) groupPlaying.set(g.key, r.playing);
       return { group: g.name, host: g.host, playing: r.playing, members: r.members };
     }));
     inGroup = GRP.annotate(devices, reports);
@@ -171,13 +177,14 @@ async function verifyPlaying(devices, groupPlaying) {
   const map = new Map();
   const probes = [];
   for (const d of devices) {
+    if (d.protocol !== 'cast') continue;
     if (!d.audio_only) continue;
     if (d.is_group) {                      // already answered by the group scan
-      if (groupPlaying.has(d.name)) map.set(d.name, groupPlaying.get(d.name));
+      if (groupPlaying.has(d.key)) map.set(d.key, groupPlaying.get(d.key));
       continue;
     }
     probes.push(GRP.readPlayback(d.host, d.port)
-      .then(r => { if (r.ok) map.set(d.name, r.playing); })
+      .then(r => { if (r.ok) map.set(d.key, r.playing); })
       .catch(() => {}));
   }
   await Promise.all(probes);
@@ -186,9 +193,15 @@ async function verifyPlaying(devices, groupPlaying) {
 }
 
 function deviceList() {
-  S.devices = [...DEV.values()].sort((a, b) =>
+  S.devices = [...DEV.values(), ...SONOS.devices()].sort((a, b) =>
     (a.audio_only === b.audio_only) ? a.name.localeCompare(b.name) : (a.audio_only ? -1 : 1));
   return S.devices;
+}
+
+function findDevice(selector) {
+  const devices = deviceList();
+  return devices.find(d => d.key === selector)
+    || devices.find(d => d.name === selector) || null;
 }
 
 /* Browse on EVERY external IPv4 interface, not whichever one the library picks.
@@ -205,6 +218,7 @@ let browsers = [];            // one per interface
 S.discovery = { started: false, interfaces: [], error: null };
 
 function startDiscovery() {
+  SONOS.start(e => logErr('ssdp: ' + e.message));
   if (browsers.length) return;
   const ifaces = externalIPv4();
   S.discovery.interfaces = [];
@@ -230,15 +244,17 @@ function startDiscovery() {
      picks a virtual adapter (Hyper-V, WSL, VPN) and sees nothing. */
   spin('default', undefined);
   for (const i of ifaces) spin(`${i.name} ${i.address}`, { interface: i.address });
-  if (!browsers.length) {
+  if (!browsers.length && !SONOS.diagnostics().started) {
     S.discovery.error = 'could not open mDNS on any interface';
     S.discoveryError = S.discovery.error;
     throw new Error(S.discovery.error);
   }
   S.discovery.started = true;
-  setInterval(() => { for (const b of browsers) { try { b.browser.update(); } catch {} } }, 20000).unref();
-  console.log(`[discovery] browsing on ${browsers.length} interface(s): `
-    + browsers.map(b => b.label).join(', '));
+  if (browsers.length) {
+    setInterval(() => { for (const b of browsers) { try { b.browser.update(); } catch {} } }, 20000).unref();
+  }
+  console.log(`[discovery] Cast on ${browsers.length} interface(s); Sonos SSDP `
+    + (SONOS.diagnostics().started ? 'started' : 'unavailable'));
 }
 
 /* Wait until the device set stops growing. If `want` is given, do not settle
@@ -247,17 +263,19 @@ function startDiscovery() {
 async function discover(ms = 9000, want = null) {
   // must not throw: the caller needs to reach the "discovery is blocked" reply
   try { startDiscovery(); } catch { /* recorded in S.discovery.error */ }
-  if (!browsers.length) return deviceList();
   for (const b of browsers) { try { b.browser.update(); } catch {} }
   const deadline = Date.now() + ms;
   const floor = Date.now() + 3500;
   let last = -1, stable = 0;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 700));
-    const settled = DEV.size === last ? ++stable >= 5 : (stable = 0, last = DEV.size, false);
-    if (settled && DEV.size > 0 && Date.now() > floor && (!want || DEV.has(want))) break;
+    await SONOS.refresh().catch(() => {});
+    const count = DEV.size + SONOS.devices().length;
+    const settled = count === last ? ++stable >= 5 : (stable = 0, last = count, false);
+    if (settled && count > 0 && Date.now() > floor && (!want || findDevice(want))) break;
   }
-  if (want && !DEV.has(want)) console.log(`[discovery] ${want} did not answer in ${ms}ms`);
+  await SONOS.refresh(false).catch(() => {});
+  if (want && !findDevice(want)) console.log(`[discovery] ${want} did not answer in ${ms}ms`);
   return deviceList();
 }
 
@@ -316,8 +334,10 @@ const p = (obj, fn, ...a) => new Promise((res, rej) =>
 
 async function teardown() {
   try { S.client && S.client.close(); } catch {}
-  S.client = null; S.player = null;
+  S.client = null; S.player = null; S.sonos = null; S.sonosGroup = null;
 }
+
+const connected = () => !!(S.player || S.sonos);
 
 /* "Stop" has to actually mean stop. player.stop() only silences the media and
    leaves the receiver app loaded, so the speaker keeps advertising st=1 with
@@ -325,36 +345,103 @@ async function teardown() {
    to idle. Quitting the session is what releases it, and since the queue lives
    on the speaker that is also what clears the queue. */
 async function stopEverything() {
-  if (!S.player) return false;
-  try { await p(S.player, 'stop'); } catch {}            // silence it first
-  try { await p(S.client, 'stop', S.player); } catch {}  // then quit the receiver
+  if (!connected()) return false;
+  if (S.protocol === 'sonos') {
+    try { await S.sonos.stop(); } catch {}
+    try { await S.sonos.flush(); } catch {}
+  } else {
+    try { await p(S.player, 'stop'); } catch {}            // silence it first
+    try { await p(S.client, 'stop', S.player); } catch {}  // then quit the receiver
+  }
   S.qcache = null; S.identity = null; S.media = null;
   S.srcUrl = null; S.expire = null; S.cdnUrl = null;
+  S.queueActive = false;
   fillToken++; S.fill = null;              // stop means stop filling too
-  S.device = null; S.host = null;          // and stops being "the" speaker
+  S.device = null; S.deviceName = null; S.host = null; S.protocol = null;
   groupCache = { at: 0, val: { inGroup: new Map(), groupPlaying: new Map() } };
   liveCache = { at: 0, map: new Map() };    // both change the moment this lands
   await teardown();
-  console.log('[stop] receiver quit, speaker released');
+  console.log('[stop] playback stopped, speaker released');
   return true;
 }
 
-async function connectDevice(name) {
-  console.log(`[connect] ${name}`);
-  let dev = DEV.get(name);
-  if (!dev) dev = (await discover(9000)).find(d => d.name === name);
-  if (!dev) throw new Error(`device ${name} not found`);
+async function connectDevice(selector) {
+  console.log(`[connect] ${selector}`);
+  let dev = findDevice(selector);
+  if (!dev) dev = (await discover(9000, selector)).find(d => d.key === selector || d.name === selector);
+  if (!dev) throw new Error(`device ${selector} not found`);
   await teardown();
+  S.qcache = null; S.queueActive = false;
+  fillToken++; S.fill = null;
+  if (dev.protocol === 'sonos') {
+    const ctl = SONOS.controller(dev);
+    S.sonos = ctl.player; S.sonosGroup = ctl.group;
+    S.device = dev.key; S.deviceName = dev.name; S.host = dev.host; S.protocol = 'sonos';
+    console.log(`[connect] Sonos coordinator ${dev.host}:${dev.port}`
+      + (dev.is_group ? ` (${dev.group_members.join(', ')})` : ''));
+    return { sonos: S.sonos, dev };
+  }
   let client;
   try { client = await pconnect(dev.host, dev.port); }
   catch (e) { console.log(`[connect] FAILED ${dev.host}:${dev.port}: ${e && e.message}`); throw e; }
   console.log(`[connect] tls up to ${dev.host}:${dev.port}${dev.is_group ? ' (group)' : ''}`);
-  S.client = client; S.device = name; S.host = dev.host;
+  S.client = client; S.device = dev.key; S.deviceName = dev.name;
+  S.host = dev.host; S.protocol = 'cast';
   return { client, dev };
+}
+
+async function sonosMedia(track) {
+  if (!track || !track.uri) return null;
+  const contentId = track.uri;
+  const selfId = SO.videoIdFromArt(track.albumArtURL || track.albumArtURI);
+  const existing = S.identity && S.identity.contentId === contentId ? S.identity : null;
+  let hit = selfId ? { video_id: selfId,
+    src_url: `https://www.youtube.com/watch?v=${selfId}`, matched_on: 'thumbnail' }
+    : recall({ content_id: contentId, title: track.title, duration: track.duration });
+  if (!hit && existing && existing.video_id) hit = { video_id: existing.video_id,
+    src_url: `https://www.youtube.com/watch?v=${existing.video_id}`,
+    confidence: existing.confidence };
+  if (!hit && !existing && track.title && !identifying) {
+    identifying = true;
+    identify(track.title, track.duration).then(guess => {
+      if (!guess || !S.identity || S.identity.contentId !== contentId) return;
+      S.identity.video_id = guess.video_id; S.identity.confidence = guess.confidence;
+      S.srcUrl = `https://www.youtube.com/watch?v=${guess.video_id}`;
+    }).catch(() => {}).finally(() => { identifying = false; });
+  }
+  const videoId = hit && hit.video_id;
+  S.identity = { contentId, video_id: videoId || null,
+    confidence: (hit && hit.confidence) || (videoId ? 'exact' : 'none') };
+  if (hit && hit.src_url) S.srcUrl = hit.src_url;
+  S.expire = SO.expiryOf(contentId); S.cdnUrl = contentId;
+  return {
+    title: track.title || '(already playing)', duration: track.duration || null,
+    acodec: (S.media && S.media.acodec) || null,
+    abr: (S.media && S.media.abr) || null, ext: (S.media && S.media.ext) || null,
+    video_id: videoId || null,
+    identified: { confidence: S.identity.confidence }, adopted: true,
+  };
+}
+
+async function attachSonos(selector) {
+  await connectDevice(selector);
+  S.media = null; S.srcUrl = null; S.expire = null; S.qcache = null;
+  const [state, track] = await Promise.all([S.sonos.getCurrentState(), S.sonos.currentTrack()]);
+  if (!SO.ACTIVE_STATES.has(state) || !track || !track.uri) {
+    return { adopted: false, app: 'Sonos' };
+  }
+  S.media = await sonosMedia(track);
+  await syncQueue().catch(() => {});
+  S.queueActive = !!(S.qcache && (S.qcache.queue_owned || S.qcache.total > 1
+    || S.qcache.repeat !== 'off'));
+  return { adopted: true, app: 'Sonos', media: S.media };
 }
 
 /* attach WITHOUT starting playback: join whatever session is live */
 async function attach(name) {
+  const dev = findDevice(name);
+  if ((dev && dev.protocol === 'sonos') || String(name).startsWith('sonos:'))
+    return attachSonos(name);
   const { client } = await connectDevice(name);
   S.media = null; S.srcUrl = null; S.expire = null;
   // getSessions() straight after connect() can come back empty before the
@@ -375,7 +462,7 @@ async function attach(name) {
     const role = GRP.roleFromAppId(appId);
     let group = null;
     if (role) {
-      try { const g = (await groupPlayback(deviceList())).inGroup.get(name); group = g ? g.group : null; }
+      try { const g = (await groupPlayback(deviceList())).inGroup.get(S.deviceName); group = g ? g.group : null; }
       catch (e) { logErr('group lookup: ' + e.message); }
     }
     console.log(`[attach] no ${DMR_APP_ID} session after 3.2s (saw ${sessions.length}: ` +
@@ -423,6 +510,8 @@ async function attach(name) {
       console.log(r ? `[identify] ${r.video_id} delta=${r.delta} ${r.confidence}` : '[identify] no match');
     });
   }
+  const q = await syncQueue().catch(() => null);
+  S.queueActive = !!(q && q.total > 1);
   return { adopted: true, app: live.displayName, media: S.media };
 }
 
@@ -433,8 +522,27 @@ async function loadMedia(pageUrl) {
 }
 
 async function castUrl(pageUrl, name) {
-  const { client } = await connectDevice(name);
+  const connection = await connectDevice(name);
   const m = await extract(pageUrl);
+  if (connection.sonos) {
+    try { await S.sonos.stop(); } catch {}
+    await S.sonos.flush();
+    const queued = await S.sonos.queue(SO.mediaItem(m, {
+      video_id: m.video_id, title: m.title, duration: m.duration, url: pageUrl, thumb: m.thumb,
+    }));
+    await S.sonos.selectQueue();
+    await S.sonos.selectTrack(Number(queued.FirstTrackNumberEnqueued) || 1);
+    await S.sonos.setPlayMode('NORMAL');
+    await S.sonos.play();
+    S.media = { title: m.title, duration: m.duration, abr: m.abr, acodec: m.acodec,
+      ext: m.ext, video_id: m.video_id };
+    S.srcUrl = pageUrl; S.rebuffers = 0; S.lastState = null;
+    S.expire = expiryOf(m.url); S.cdnUrl = m.url;
+    S.qcache = null; S.queueActive = false;
+    remember(m.video_id, pageUrl, m.title, m.duration, m.url, null);
+    return S.media;
+  }
+  const { client } = connection;
   // a resident mirroring app holds the receiver and SILENTLY ignores load()
   const sessions = await p(client, 'getSessions');
   for (const s of sessions || []) {
@@ -454,6 +562,7 @@ async function castUrl(pageUrl, name) {
     ext: m.ext, video_id: m.video_id };
   S.srcUrl = pageUrl; S.rebuffers = 0; S.lastState = null;
   S.expire = expiryOf(m.url); S.cdnUrl = m.url;
+  S.queueActive = false;
   let sid = null; try { sid = ((await p(client, 'getSessions')) || [])[0]?.sessionId; } catch {}
   remember(m.video_id, pageUrl, m.title, m.duration, m.url, sid);
   return S.media;
@@ -519,14 +628,44 @@ S.fill = null;                    // progress of the background queue fill
 let fillToken = 0;                // bumped per load, so a stale fill stops itself
 
 const asCastItem = async entry => CQ.item(await extract(entry.url), entry);
+const asSonosItem = async (entry, queueOwned = false) => {
+  const media = await extract(entry.url);
+  remember(media.video_id || entry.video_id, entry.url, media.title, media.duration, media.url, null);
+  return { ...SO.mediaItem(media, { ...entry, queue_owned: queueOwned }),
+    _media: media, _entry: entry };
+};
 
 /* Push items in batches: one Cast message caps at 64KB (50 items load, 60 kills
    the connection), so 25 at a time with room to spare. */
-async function insertBatched(items) {
+const queueTarget = token => ({ token, device: S.device, protocol: S.protocol,
+  sonos: S.sonos, player: S.player });
+const targetIsCurrent = target => target && target.token === fillToken
+  && target.device === S.device && target.protocol === S.protocol
+  && target.sonos === S.sonos && target.player === S.player;
+const ensureTarget = target => {
+  if (target && !targetIsCurrent(target)) throw new Error('queue changed while items were resolving');
+};
+
+async function insertBatched(items, target = null) {
+  const protocol = target ? target.protocol : S.protocol;
+  ensureTarget(target);
+  if (protocol === 'sonos') {
+    const sonos = target ? target.sonos : S.sonos;
+    for (const item of items) { ensureTarget(target); await sonos.queue(item); }
+    return;
+  }
+  const player = target ? target.player : S.player;
   for (let i = 0; i < items.length; i += CQ.BATCH) {
-    await p(S.player, 'queueInsert', items.slice(i, i + CQ.BATCH), {});
+    ensureTarget(target);
+    await p(player, 'queueInsert', items.slice(i, i + CQ.BATCH), {});
     await new Promise(r => setTimeout(r, 400));
   }
+}
+
+async function sonosQueueSelected() {
+  if (!S.sonos) return false;
+  try { return /^x-rincon-queue:/i.test((await S.sonos.getMediaInfo()).currentUri); }
+  catch { return false; }
 }
 
 /* Extraction costs ~8s a video, so a long playlist cannot be resolved up front.
@@ -540,6 +679,14 @@ async function insertBatched(items) {
    with INVALID_MEDIA_SESSION_ID - and getStatus also refreshes the controller's
    own mediaSessionId, which insert depends on. */
 async function queueIsLive() {
+  if (S.protocol === 'sonos' && S.sonos) {
+    try {
+      const [state, queue, selected] = await Promise.all([
+        S.sonos.getCurrentState(), S.sonos.getQueue(), sonosQueueSelected(),
+      ]);
+      return selected && SO.ACTIVE_STATES.has(state) && !!(queue && queue.items && queue.items.length);
+    } catch { return false; }
+  }
   if (!S.player) return false;
   try {
     const st = await p(S.player, 'getStatus');
@@ -559,14 +706,58 @@ async function ensurePlayer() {
   return S.player;
 }
 
-async function loadQueue(entries, startIndex, opts) {
-  await ensurePlayer();
+async function loadSonosQueue(entries, startIndex, opts) {
+  if (!S.sonos) throw new Error('no Sonos speaker connected');
+  const token = ++fillToken;
+  const target = queueTarget(token);
   const ordered = entries.slice(startIndex).concat(entries.slice(0, startIndex));
   const head = [];
-  for (const e of ordered.slice(0, CQ.HEAD)) head.push(await asCastItem(e));
-  await p(S.player, 'queueLoad', head, { startIndex: 0,
+  for (const entry of ordered.slice(0, CQ.HEAD)) {
+    head.push(await asSonosItem(entry, true)); ensureTarget(target);
+  }
+  if (!head.length) throw new Error('playlist is empty');
+  try { await target.sonos.stop(); } catch {}
+  ensureTarget(target); await target.sonos.flush();
+  await insertBatched(head, target);
+  ensureTarget(target); await target.sonos.selectQueue();
+  ensureTarget(target); await target.sonos.selectTrack(1);
+  ensureTarget(target); await target.sonos.setPlayMode(SO.REPEAT_TO_SONOS[opts.repeat || 'off']);
+  ensureTarget(target); await target.sonos.play();
+  const first = head[0]._media;
+  S.media = { title: first.title, duration: first.duration, abr: first.abr,
+    acodec: first.acodec, ext: first.ext, video_id: first.video_id };
+  S.srcUrl = head[0]._entry.url; S.expire = expiryOf(first.url); S.cdnUrl = first.url;
+  S.queueActive = true; S.qcache = null; S.rebuffers = 0; S.lastState = null;
+
+  const rest = ordered.slice(CQ.HEAD);
+  S.fill = { done: 0, total: rest.length };
+  (async () => {
+    for (const entry of rest) {
+      if (token !== fillToken) return;
+      let item = null;
+      try { item = await asSonosItem(entry, true); } catch (err) { logErr('Sonos fill: ' + err.message); }
+      if (token !== fillToken) return;
+      S.fill = { done: S.fill.done + 1, total: rest.length };
+      if (item) await insertBatched([item], target);
+    }
+    if (token === fillToken) S.fill = null;
+  })().catch(err => { if (token === fillToken) { logErr('Sonos fill: ' + err.message); S.fill = null; } });
+}
+
+async function loadQueue(entries, startIndex, opts) {
+  if (S.protocol === 'sonos') return loadSonosQueue(entries, startIndex, opts);
+  const token = ++fillToken;
+  const target = queueTarget(token);
+  await ensurePlayer();
+  target.player = S.player;
+  const ordered = entries.slice(startIndex).concat(entries.slice(0, startIndex));
+  const head = [];
+  for (const e of ordered.slice(0, CQ.HEAD)) { head.push(await asCastItem(e)); ensureTarget(target); }
+  ensureTarget(target);
+  await p(target.player, 'queueLoad', head, { startIndex: 0,
     repeatMode: CQ.REPEAT[opts.repeat || 'off'] });
   console.log(`[queue] loaded ${head.length}, filling ${ordered.length - head.length} more`);
+  S.queueActive = true;
   head.forEach(h => remember(h.customData.video_id, h.customData.page,
     h.customData.title, h.customData.duration, h.media.contentId, null));
 
@@ -575,7 +766,6 @@ async function loadQueue(entries, startIndex, opts) {
      fill keeps extracting and inserts its leftovers into the queue that
      replaced it - and both fills write the same S.fill, which is how progress
      ends up reading "8 of 7". */
-  const token = ++fillToken;
   S.fill = { done: 0, total: rest.length };
   (async () => {
     for (const e of rest) {
@@ -589,18 +779,33 @@ async function loadQueue(entries, startIndex, opts) {
          extracted - about ten seconds a track, so over a minute of a ten track
          playlist showing only its first three, which reads as broken. A batch
          is a size ceiling for one message, not an amount worth waiting for. */
-      if (item) await insertBatched([item]);
+      if (item) await insertBatched([item], target);
     }
     if (token !== fillToken) return;
     console.log(`[queue] fill complete (${rest.length} queued behind the head)`);
     S.fill = null;
-  })().catch(e => { logErr('fill: ' + e.message);
-                    if (token === fillToken) S.fill = null; });
+  })().catch(e => { if (token === fillToken) { logErr('fill: ' + e.message); S.fill = null; } });
 }
 
 /* Read the live queue off the speaker. getStatus only returns a 2-item window,
    so the full list comes from QUEUE_GET_ITEM_IDS + QUEUE_GET_ITEMS. */
 async function speakerQueue() {
+  if (S.protocol === 'sonos' && S.sonos) {
+    try {
+      if (!await sonosQueueSelected()) return null;
+      const [queue, track, mode] = await Promise.all([
+        S.sonos.getQueue(), S.sonos.currentTrack(), S.sonos.getPlayMode(),
+      ]);
+      if (!queue || !queue.items || !queue.items.length) return null;
+      const items = queue.items.map((item, index) => SO.describeQueueItem(item, index, recall));
+      const pos = Math.max(0, Math.min(items.length - 1, (Number(track.queuePosition) || 1) - 1));
+      const itemIds = items.map((item, index) => `${index}:${cdnToken(item.contentId) || item.contentId || ''}`);
+      return { items, itemIds, pos, total: items.length,
+        repeat: SO.repeatFromSonos(mode), shuffle: /^SHUFFLE/.test(mode),
+        queue_owned: items.some(item => item.queue_owned),
+        currentItemId: itemIds[pos] };
+    } catch (e) { return null; }
+  }
   if (!S.player) return null;
   try {
     const q = await CQ.readQueue(S.player);
@@ -609,7 +814,7 @@ async function speakerQueue() {
     const pos = Math.max(0, q.itemIds.indexOf(q.status.currentItemId));
     return { items, itemIds: q.itemIds, pos, total: q.itemIds.length,
              repeat: Object.keys(CQ.REPEAT).find(k => CQ.REPEAT[k] === q.status.repeatMode) || 'off',
-             currentItemId: q.status.currentItemId };
+             shuffle: false, currentItemId: q.status.currentItemId };
   } catch (e) { return null; }
 }
 
@@ -617,6 +822,74 @@ async function speakerQueue() {
    speaker, so two clients doing this converge instead of fighting: whoever gets
    there first makes the item fresh, and the other sees fresh and does nothing. */
 async function refreshExpiring() {
+  if (S.protocol === 'sonos') {
+    if (!S.queueActive || !S.sonos) return;
+    const q = await speakerQueue();
+    if (!q) return;
+    const now = Date.now() / 1000;
+    const current = q.items[q.pos];
+    if (current && current.expires
+        && current.expires - now < CQ.REFRESH_BELOW && current.url) {
+      const target = queueTarget(fillToken);
+      const fresh = await asSonosItem({ video_id: current.video_id, url: current.url,
+        title: current.title, duration: current.duration, thumb: current.thumb }, true);
+      ensureTarget(target);
+      const latest = await speakerQueue();
+      ensureTarget(target);
+      const latestCurrent = latest && latest.items[latest.pos];
+      const sameItem = latestCurrent && (current.video_id && latestCurrent.video_id
+        ? current.video_id === latestCurrent.video_id
+        : current.contentId && current.contentId === latestCurrent.contentId);
+      if (!sameItem || latest.pos !== q.pos) return;
+      const [track, state] = await Promise.all([
+        target.sonos.currentTrack(), target.sonos.getCurrentState(),
+      ]);
+      ensureTarget(target);
+      const liveVideoId = SO.videoIdFromArt(track.albumArtURI || track.albumArtURL);
+      const sameTrack = track.queuePosition === latest.pos + 1
+        && (liveVideoId && current.video_id
+          ? liveVideoId === current.video_id
+          : !track.uri || track.uri === latestCurrent.contentId);
+      if (!sameTrack) return;
+      const observedAt = Date.now();
+      const trackNumber = latest.pos + 1;
+      await target.sonos.queue(fresh, trackNumber);
+      ensureTarget(target); await target.sonos.selectTrack(trackNumber);
+      ensureTarget(target); await target.sonos.removeTracksFromQueue(trackNumber + 1, 1);
+      const elapsed = state === 'playing' || state === 'transitioning'
+        ? (Date.now() - observedAt) / 1000 : 0;
+      if (track.position + elapsed > 0) {
+        ensureTarget(target); await target.sonos.seek(track.position + elapsed);
+      }
+      S.expire = expiryOf(fresh._media.url); S.cdnUrl = fresh._media.url;
+      S.refreshes++; S.lastRefresh = Date.now();
+      await syncQueue();
+      return;
+    }
+    /* Replacing a future item is safe: insert the fresh URI immediately before
+       it, then remove the stale copy that shifted one place. The current item is
+       left alone; it was refreshed while it was still upcoming. */
+    const stale = q.items.map((item, index) => ({ item, index }))
+      .filter(x => x.index !== q.pos && x.item.expires
+        && x.item.expires - now < CQ.REFRESH_BELOW && x.item.url);
+    const target = queueTarget(fillToken);
+    for (const { item, index } of stale.slice(0, CQ.BATCH)) {
+      try {
+        ensureTarget(target);
+        const fresh = await asSonosItem({ video_id: item.video_id, url: item.url,
+          title: item.title, duration: item.duration, thumb: item.thumb });
+        ensureTarget(target);
+        const trackNumber = index + 1;
+        await target.sonos.queue(fresh, trackNumber);
+        ensureTarget(target); await target.sonos.removeTracksFromQueue(trackNumber + 1, 1);
+      } catch (e) {
+        if (!targetIsCurrent(target)) return;
+        logErr('Sonos refresh ' + item.video_id + ': ' + e.message);
+      }
+    }
+    if (stale.length) { ensureTarget(target); await syncQueue(); }
+    return;
+  }
   const q = await speakerQueue();
   if (!q) return;
   const now = Date.now() / 1000;
@@ -639,24 +912,34 @@ async function reissue(reason) {
   if (!S.srcUrl || !S.device) return;
   try {
     let pos = 0;
-    try { pos = (await p(S.player, 'getStatus')).currentTime || 0; } catch {}
+    try {
+      pos = S.protocol === 'sonos'
+        ? (await S.sonos.currentTrack()).position || 0
+        : (await p(S.player, 'getStatus')).currentTime || 0;
+    } catch {}
     console.log(`[auto-refresh] ${reason}; resuming at ${pos.toFixed(0)}s`);
     await castUrl(S.srcUrl, S.device);
     await new Promise(r => setTimeout(r, 2500));
-    if (pos > 5) { try { await p(S.player, 'seek', pos); } catch (e) { logErr('seek: ' + e); } }
+    if (pos > 5) {
+      try {
+        if (S.protocol === 'sonos') await S.sonos.seek(pos);
+        else await p(S.player, 'seek', pos);
+      } catch (e) { logErr('seek: ' + e); }
+    }
     S.refreshes++; S.lastRefresh = Date.now();
   } catch (e) { logErr('auto-refresh failed: ' + e); }
 }
 
 setInterval(async () => {
   try {
-    if (!S.player || !S.srcUrl) return;
+    if (!connected() || !S.srcUrl) return;
     // A queue is refreshed in place by refreshExpiring(); reissue() replaces the
     // whole media session and would wipe it.
-    if (S.qcache) return;
+    if (S.queueActive || (S.protocol === 'cast' && S.qcache)) return;
     if (Date.now() - S.lastRefresh < 60000) return;
     if (S.expire && Date.now() / 1000 > S.expire - 300)
       return void reissue(`cdn url expires in ${Math.round(S.expire - Date.now() / 1000)}s`);
+    if (S.protocol === 'sonos') return;
     const st = await p(S.player, 'getStatus');
     if (st && st.playerState === 'IDLE' && ['ERROR', 'INTERRUPTED'].includes(st.idleReason))
       reissue(`receiver went IDLE (${st.idleReason})`);
@@ -670,12 +953,12 @@ let qver = 0;
 async function syncQueue() {
   const q = await speakerQueue();
   if (!q) { S.qcache = null; return null; }
-  const sig = q.itemIds.join(',') + '|' + q.currentItemId + '|' + q.repeat;
+  const sig = q.itemIds.join(',') + '|' + q.currentItemId + '|' + q.repeat + '|' + q.shuffle;
   if (!S.qcache || S.qcache.sig !== sig) { qver++; }
   S.qcache = { ...q, sig, version: qver };
   return S.qcache;
 }
-setInterval(() => { if (S.player) syncQueue().catch(() => {}); }, 4000).unref();
+setInterval(() => { if (connected()) syncQueue().catch(() => {}); }, 4000).unref();
 
 /* ---------- api ---------- */
 const app = express();
@@ -690,44 +973,51 @@ app.get('/api/devices', async (req, res) => {
       await discover(req.query.refresh === '1' ? 15000 : 12000);
       settledOnce = true;
     }
-    if (S.discoveryError && !DEV.size) {
-      /* mDNS binds udp/5353 on 0.0.0.0, which is the one thing here that needs a
-         firewall allowance. Say so rather than returning a bare 500. */
+    await SONOS.refresh(req.query.refresh === '1').catch(() => {});
+    if (S.protocol === 'sonos' && S.device) {
+      S.device = SONOS.resolveKey(S.device);
+      const selected = SONOS.devices().find(d => d.key === S.device);
+      if (selected) S.deviceName = selected.name;
+    }
+    const devices = deviceList();
+    if ((S.discoveryError || SONOS.diagnostics().error) && !devices.length) {
       return res.json({ devices: [], connected: S.device, settled: true,
         active: null, active_count: 0,
         error: 'Cannot search for speakers on this network.',
-        hint: 'Finding Cast devices needs UDP port 5353. Allow the app through '
+        hint: 'Finding Cast and Sonos speakers needs local multicast (UDP ports 5353 and 1900). Allow the app through '
             + 'your firewall (Windows usually asks on first run), then press the '
             + 'refresh button.',
-        detail: S.discoveryError });
+        detail: [S.discoveryError, SONOS.diagnostics().error].filter(Boolean).join('; ') });
     }
-    const devices = deviceList();
     /* A speaker playing as part of a group looks identical over mDNS to one
        playing alone - say which it is, so picking it is not a surprise. */
     try {
       const { inGroup, groupPlaying } = await groupPlayback(devices);
       for (const d of devices) {
+        if (d.protocol !== 'cast') { d.in_group = null; continue; }
         const g = inGroup.get(d.name);
-        d.in_group = g ? { name: g.group, role: g.role } : null;
+        const groupDevice = g && devices.find(x => x.protocol === 'cast' && x.name === g.group);
+        d.in_group = g ? { name: g.group, key: groupDevice ? groupDevice.key : g.group,
+          role: g.role } : null;
       }
       /* Correct mDNS where the devices disagree with it, so "playing" means the
          same thing in the picker, in the count, and to auto-attach. */
       const live = await verifyPlaying(devices, groupPlaying);
       for (const d of devices) {
-        if (!live.has(d.name)) continue;
-        d.busy = live.get(d.name);
+        if (d.protocol !== 'cast' || !live.has(d.key)) continue;
+        d.busy = live.get(d.key);
         if (!d.busy) d.status_text = '';
       }
     } catch (e) { logErr('group scan: ' + e.message); }
     /* Auto-attach only when exactly one audio-only speaker is busy - never to a
        video device, which would mean walking in on someone's film. */
     const active = devices.filter(d => d.busy && d.audio_only && !d.in_group);
-    res.json({ devices, connected: S.player ? S.device : null, settled: settledOnce,
-               active: active.length === 1 ? active[0].name : null,
+    res.json({ devices, connected: connected() ? S.device : null, settled: settledOnce,
+               active: active.length === 1 ? active[0].key : null,
                active_count: active.length });
   } catch (e) {
     logErr(e);
-    res.json({ devices: deviceList(), connected: S.player ? S.device : null, settled: true,
+    res.json({ devices: deviceList(), connected: connected() ? S.device : null, settled: true,
       active: null, active_count: 0, error: String(e.message || e) });
   }
 });
@@ -745,8 +1035,48 @@ app.post('/api/cast', async (req, res) => {
   catch (e) { logErr(e); res.status(500).json({ error: String(e.message || e) }); }
 });
 
+const queueStatus = () => S.qcache ? { pos: S.qcache.pos, total: S.qcache.total,
+  version: S.qcache.version, repeat: S.qcache.repeat, shuffle: !!S.qcache.shuffle,
+  item: S.qcache.items[S.qcache.pos] || null,
+  filling: S.fill ? { done: S.fill.done, total: S.fill.total } : null,
+  can_next: S.qcache.total > 1 || S.qcache.repeat !== 'off',
+  can_prev: S.qcache.total > 1 || S.qcache.repeat !== 'off' } : null;
+
+async function readSonosStatus() {
+  const [stateResult, trackResult, volumeResult, mutedResult] = await Promise.allSettled([
+    S.sonos.getCurrentState(), S.sonos.currentTrack(), S.sonosGroup.GetGroupVolume(),
+    S.sonosGroup.GetGroupMute(),
+  ]);
+  if (stateResult.status === 'rejected') throw stateResult.reason;
+  const rawState = stateResult.value;
+  const state = ({ playing: 'PLAYING', paused: 'PAUSED', transitioning: 'BUFFERING',
+    stopped: 'IDLE', no_media: 'IDLE' })[rawState] || String(rawState || '').toUpperCase();
+  if (state === 'BUFFERING' && S.lastState === 'PLAYING') S.rebuffers++;
+  S.lastState = state;
+  const track = trackResult.status === 'fulfilled' ? trackResult.value : null;
+  const live = SO.ACTIVE_STATES.has(rawState) && track && track.uri ? await sonosMedia(track) : null;
+  if (live) S.media = live;
+  else {
+    S.media = null; S.srcUrl = null; S.expire = null; S.cdnUrl = null; S.identity = null;
+  }
+  const vol = volumeResult.status === 'fulfilled' ? volumeResult.value / 100 : null;
+  const muted = mutedResult.status === 'fulfilled' ? mutedResult.value : false;
+  return { connected: true, protocol: 'sonos', device: S.device,
+    device_name: S.deviceName, app: 'Sonos', state,
+    position: (track && track.position) || 0,
+    duration: (live && live.duration) || (track && track.duration) || null,
+    volume: vol == null ? null : +vol.toFixed(2), muted, rebuffers: S.rebuffers,
+    media: live, auto_refreshes: S.refreshes, queue: queueStatus(),
+    expires_in: S.expire ? Math.round(S.expire - Date.now() / 1000) : null };
+}
+
 app.get('/api/status', async (req, res) => {
-  if (!S.player) return res.json({ connected: false });
+  if (!connected()) return res.json({ connected: false });
+  if (S.protocol === 'sonos') {
+    try { return res.json(await readSonosStatus()); }
+    catch (e) { return res.json({ connected: true, protocol: 'sonos',
+      device: S.device, error: String(e.message || e) }); }
+  }
   try {
     const st = await p(S.player, 'getStatus');
     let vol = null, muted = false;
@@ -776,30 +1106,35 @@ app.get('/api/status', async (req, res) => {
     } : null;
     const liveExpire = CQ.expiryOf(rm && rm.contentId);
 
-    res.json({ connected: true, device: S.device, app: 'Default Media Receiver',
+    res.json({ connected: true, protocol: 'cast', device: S.device,
+      device_name: S.deviceName, app: 'Default Media Receiver',
       state, position: (st && st.currentTime) || 0,
       duration: (live && live.duration) || null,
       volume: vol == null ? null : +vol.toFixed(2), muted, rebuffers: S.rebuffers,
       media: live, auto_refreshes: S.refreshes,
-      queue: S.qcache ? { pos: S.qcache.pos, total: S.qcache.total,
-        version: S.qcache.version, repeat: S.qcache.repeat,
-        item: S.qcache.items[S.qcache.pos] || null,
-        filling: S.fill ? { done: S.fill.done, total: S.fill.total } : null,
-        can_next: S.qcache.total > 1 || S.qcache.repeat !== 'off',
-        can_prev: S.qcache.total > 1 || S.qcache.repeat !== 'off' } : null,
+      queue: queueStatus(),
       expires_in: liveExpire ? Math.round(liveExpire - Date.now() / 1000) : null });
   } catch (e) { res.json({ connected: true, error: String(e.message || e) }); }
 });
 
 app.post('/api/control', async (req, res) => {
   const { action, value } = req.body || {};
-  if (!S.player && action !== 'refresh') return res.status(400).json({ error: 'not connected' });
+  if (!connected() && action !== 'refresh') return res.status(400).json({ error: 'not connected' });
   try {
-    if (action === 'play') await p(S.player, 'play');
-    else if (action === 'pause') await p(S.player, 'pause');
+    if (action === 'play') {
+      if (S.protocol === 'sonos') await S.sonos.play(); else await p(S.player, 'play');
+    } else if (action === 'pause') {
+      if (S.protocol === 'sonos') await S.sonos.pause(); else await p(S.player, 'pause');
+    }
     else if (action === 'stop') await stopEverything();
-    else if (action === 'seek') await p(S.player, 'seek', Number(value) || 0);
-    else if (action === 'volume') await p(S.client, 'setVolume', { level: Math.max(0, Math.min(1, Number(value))) });
+    else if (action === 'seek') {
+      if (S.protocol === 'sonos') await S.sonos.seek(Number(value) || 0);
+      else await p(S.player, 'seek', Number(value) || 0);
+    } else if (action === 'volume') {
+      const level = Math.max(0, Math.min(1, Number(value)));
+      if (S.protocol === 'sonos') await S.sonosGroup.SetGroupVolume(Math.round(level * 100));
+      else await p(S.client, 'setVolume', { level });
+    }
     else if (action === 'refresh') await reissue('manual');
     else return res.status(400).json({ error: 'unknown action ' + action });
     res.json({ ok: true });
@@ -873,9 +1208,11 @@ const shuffledCopy = arr => { const a = [...arr];
 /* The receiver owns position, so skipping is a jump instruction to it rather
    than a track we pick and load ourselves. */
 async function skip(dir, res) {
-  if (!S.player || !S.qcache) return res.status(400).json({ error: 'nothing queued' });
+  if (!connected() || !S.qcache) return res.status(400).json({ error: 'nothing queued' });
   try {
-    await p(S.player, 'queueUpdate', [], { jump: dir });
+    if (S.protocol === 'sonos') {
+      if (dir > 0) await S.sonos.next(); else await S.sonos.previous();
+    } else await p(S.player, 'queueUpdate', [], { jump: dir });
     const q = await syncQueue();
     res.json({ ok: true, pos: q ? q.pos : null, total: q ? q.total : null,
                item: q ? q.items[q.pos] : null });
@@ -889,7 +1226,8 @@ app.post('/api/queue/goto', asyncRoute(async (req, res) => {
   const pos = parseInt((req.body || {}).pos, 10);
   const itemId = S.qcache.itemIds[pos];
   if (itemId == null) return res.status(400).json({ error: 'bad position' });
-  await p(S.player, 'queueUpdate', [], { currentItemId: itemId });
+  if (S.protocol === 'sonos') await S.sonos.selectTrack(pos + 1);
+  else await p(S.player, 'queueUpdate', [], { currentItemId: itemId });
   const q = await syncQueue();
   res.json({ ok: true, pos: q ? q.pos : pos, total: q ? q.total : null,
              item: q ? q.items[q.pos] : null });
@@ -903,10 +1241,16 @@ app.post('/api/queue/stop', asyncRoute(async (req, res) => {
 /* Shuffle has to reorder on the speaker: the receiver's REPEAT_ALL_AND_SHUFFLE
    only shuffles on wrap-around, which is not what the button implies. */
 app.post('/api/queue/mode', asyncRoute(async (req, res) => {
-  if (!S.player || !S.qcache) return res.status(400).json({ error: 'nothing queued' });
+  if (!connected() || !S.qcache) return res.status(400).json({ error: 'nothing queued' });
   const { repeat, shuffle } = req.body || {};
-  if (repeat) await p(S.player, 'queueUpdate', [], { repeatMode: CQ.REPEAT[repeat] || 'REPEAT_OFF' });
-  if (shuffle === true) {
+  if (S.protocol === 'sonos') {
+    const nextRepeat = repeat || S.qcache.repeat;
+    const nextShuffle = typeof shuffle === 'boolean' ? shuffle : !!S.qcache.shuffle;
+    await S.sonos.setPlayMode(SO.playModeFor(nextRepeat, nextShuffle));
+  } else {
+    if (repeat) await p(S.player, 'queueUpdate', [], { repeatMode: CQ.REPEAT[repeat] || 'REPEAT_OFF' });
+  }
+  if (shuffle === true && S.protocol !== 'sonos') {
     const cur = S.qcache.currentItemId;
     const rest = shuffledCopy(S.qcache.itemIds.filter(i => i !== cur));
     await p(S.player, 'queueReorder', [cur, ...rest], {});
@@ -918,13 +1262,14 @@ app.post('/api/queue/mode', asyncRoute(async (req, res) => {
 /* full queue contents, read from the speaker */
 app.get('/api/queue', asyncRoute(async (req, res) => {
   const q = S.qcache || await syncQueue();
-  res.json(q ? { pos: q.pos, total: q.total, repeat: q.repeat, version: q.version,
+  res.json(q ? { pos: q.pos, total: q.total, repeat: q.repeat, shuffle: !!q.shuffle, version: q.version,
                  items: q.items } : { empty: true });
 }));
 
 /* append to what is playing: a video url, a playlist url, or a saved playlist */
 app.post('/api/queue/add', asyncRoute(async (req, res) => {
-  if (!S.client) return res.status(400).json({ error: 'not connected' });
+  if (!S.client && !S.sonos) return res.status(400).json({ error: 'not connected' });
+  const target = queueTarget(fillToken);
   const { url, playlistId } = req.body || {};
   let entries;
   if (playlistId) {
@@ -936,25 +1281,39 @@ app.post('/api/queue/add', asyncRoute(async (req, res) => {
   } else return res.status(400).json({ error: 'no url' });
   if (!entries.length) return res.status(400).json({ error: 'nothing found at that url' });
 
+  ensureTarget(target);
   const live = await queueIsLive();
-  res.json({ ok: true, added: entries.length, started: !live });
+  ensureTarget(target);
+  res.json({ ok: true, added: entries.length, started: !live,
+    total: (live && S.qcache ? S.qcache.total : 0) + entries.length });
   (async () => {
     if (!live) {                         // nothing playing: this becomes the queue
+      ensureTarget(target);
       await loadQueue(entries, 0, { repeat: 'off' });
       await syncQueue();
       return;
     }
     const buf = [];
     for (const e of entries) {
-      try { buf.push(await asCastItem(e)); } catch (err) { logErr('queue add: ' + err.message); }
-      if (buf.length >= CQ.BATCH) await insertBatched(buf.splice(0));
+      try {
+        buf.push(await (target.protocol === 'sonos' ? asSonosItem(e, true) : asCastItem(e)));
+        ensureTarget(target);
+      }
+      catch (err) {
+        if (!targetIsCurrent(target)) throw err;
+        logErr('queue add: ' + err.message);
+      }
+      if (buf.length >= CQ.BATCH) await insertBatched(buf.splice(0), target);
     }
-    if (buf.length) await insertBatched(buf);
+    if (buf.length) await insertBatched(buf, target);
+    ensureTarget(target);
+    S.queueActive = true;
     await syncQueue();
     console.log(`[queue] appended ${entries.length}`);
   })().catch(async e => {
+    if (!targetIsCurrent(target)) return;
     logErr('queue add: ' + e.message);
-    if (/MEDIA_SESSION/i.test(e.message)) {     // session died mid-append
+    if (targetIsCurrent(target) && target.protocol === 'cast' && /MEDIA_SESSION/i.test(e.message)) {
       try { await loadQueue(entries, 0, { repeat: 'off' }); await syncQueue(); } catch {}
     }
   });
@@ -962,10 +1321,10 @@ app.post('/api/queue/add', asyncRoute(async (req, res) => {
 
 app.get('/api/diagnostics', (req, res) => res.json({
   platform: process.platform, arch: process.arch,
-  discovery: S.discovery,
+  discovery: { ...S.discovery, sonos: SONOS.diagnostics() },
   interfaces: externalIPv4(),
-  devices_found: DEV.size,
-  device_names: [...DEV.keys()],
+  devices_found: deviceList().length,
+  device_names: deviceList().map(d => d.name),
   connected: S.device,
   recent_errors: S.errors.slice(-5),
 }));
@@ -988,5 +1347,7 @@ function start(port = process.env.PORT || 8765, host = process.env.HOST || '127.
     srv.on('error', e => reject(new Error(`cannot listen on ${host}:${port} - ${e.message}`)));
   });
 }
-module.exports = { start, app, S };
+function shutdown() { SONOS.stop(); }
+
+module.exports = { start, shutdown, app, S };
 if (require.main === module) start();

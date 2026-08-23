@@ -156,14 +156,14 @@ button.mini.done{background:var(--ok)}
 <button class="ghost mini" id="exitexpand" title="Exit theater mode (Esc)">✕ Exit</button>
 <div class="wrap">
   <h1>YouTube Audio Caster</h1>
-  <div class="sub">Native buffered audio to a Cast speaker &middot; video stays local &amp; synced</div>
+  <div class="sub">Native buffered audio to Cast and Sonos speakers &middot; video stays local &amp; synced</div>
 
   <div class="card">
     <div class="row">
       <input type="text" id="url" placeholder="Paste a YouTube link…"
              value="">
       <select id="device"></select>
-      <button id="go">Cast</button>
+      <button id="go">Play</button>
       <button class="ghost" id="queueadd" title="Append to what is playing instead of replacing it">＋ Queue</button>
       <button class="ghost" id="rescan" title="Re-scan for devices" aria-label="Re-scan for devices"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg></button>
     </div>
@@ -356,21 +356,23 @@ const deviceOptions = ds => { DEVS = ds || [];
      their own "no speakers found" message */
   if (!DEVS.length) return '';
   return PICK_NONE + DEVS.map(d=>{
-  const kind = d.is_group ? 'group' : (d.audio_only ? 'speaker' : 'video');
+  const kind = d.protocol==='sonos'
+    ? (d.is_group ? 'Sonos group' : 'Sonos speaker')
+    : (d.is_group ? 'Cast group' : (d.audio_only ? 'Cast speaker' : 'Cast video'));
   /* A speaker playing as part of a group is busy in exactly the way a speaker
      playing alone is busy - naming the group is the only way to tell them
      apart, so say that instead of echoing the track title. */
   const busy = d.in_group
     ? ' ▸ in ' + d.in_group.name + (d.in_group.role === 'leader' ? ' (master)' : '')
     : (d.busy ? ' ▸ ' + (d.status_text || 'playing').slice(0,28) : '');
-  return `<option value="${esc(d.name)}">${esc(d.name)} — ${kind}${esc(busy)}</option>`;
+  return `<option value="${esc(d.key||d.name)}">${esc(d.name)} — ${kind}${esc(busy)}</option>`;
 }).join(''); };
 
 /* Explain a speaker that is only making sound because a group told it to.
    Picking one and seeing no video is otherwise baffling. */
 function groupNote(){
   const el = $('groupnote'); if(!el) return;
-  const d = DEVS.find(x => x.name === $('device').value);
+  const d = DEVS.find(x => (x.key||x.name) === $('device').value);
   const g = d && d.in_group;
   if(!g){ el.classList.add('hide'); el.innerHTML=''; return; }
   el.classList.remove('hide');
@@ -382,7 +384,7 @@ function groupNote(){
   /* looked up through the container, not by id: the anchor only exists once
      this has rendered, and a bare id lookup would read as a dangling reference */
   const a = el.querySelector('a[data-switch]');
-  if(a) a.onclick = e => { e.preventDefault(); $('device').value = g.name;
+  if(a) a.onclick = e => { e.preventDefault(); $('device').value = g.key||g.name;
                            groupNote(); attach(); };
 }
 
@@ -396,7 +398,7 @@ async function syncDevices(){
     if(html && html!==$('device').innerHTML){
       const keep=$('device').value;
       $('device').innerHTML=html;
-      if(keep && j.devices.some(d=>d.name===keep)) $('device').value=keep;
+      if(keep && j.devices.some(d=>(d.key||d.name)===keep)) $('device').value=keep;
       else if(j.connected) $('device').value=j.connected;
       clog('device list updated ('+j.devices.length+')');
     }
@@ -440,7 +442,7 @@ async function explainNoSpeakers(){
   const rows = d ? (d.discovery.interfaces||[]).map(i=>
     `${esc(i.label)} — ${i.ok?'listening':'failed: '+esc(i.error||'')}`).join('<br>') : '';
   msg(`<b>No speakers found on this network.</b><br>
-    Cast devices are found over mDNS (UDP port 5353). Things worth checking:<br>
+    Cast uses mDNS (UDP 5353); Sonos uses SSDP (UDP 1900). Things worth checking:<br>
     • this computer is on the <b>same network</b> as the speakers, not a guest network or VPN<br>
     • the app is allowed through the firewall for <b>both private and public</b> networks<br>
     • the speakers are powered on<br>
@@ -452,31 +454,32 @@ async function explainNoSpeakers(){
 
 async function attach(){
   const dev=$('device').value; if(!dev) return;
+  const devName=(DEVS.find(d=>(d.key||d.name)===dev)||{}).name||dev;
   try{
     const j=await api('/api/attach',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({device:dev})});
     const vid = j.media && j.media.video_id;
     clog('attach adopted='+j.adopted+' video_id='+vid);
     if(vid){                       // identified: show it, whoever started it
-      msg('attached to the session playing on '+dev,'ok');
+      msg('attached to the session playing on '+devName,'ok');
       mountVideo(vid);
     } else if(j.adopted){          // adopted but not yet identified - tick() may still mount
-      msg('attached to the session playing on '+dev,'ok');
+      msg('attached to the session playing on '+devName,'ok');
       $('noplayer').textContent='Working out what is playing…';
     } else if(j.group_role){     // it is singing, but as one voice in a group
       clearVideo();
-      msg(dev+' is playing as part of '+(j.group||'a speaker group')+
+      msg(devName+' is playing as part of '+(j.group||'a speaker group')+
           (j.group_role==='leader'?' (it is the master)':''),'ok');
       $('noplayer').textContent = j.group_role==='leader'
-        ? dev+' is leading '+(j.group||'a group')+'. Pick the group to see and control it.'
-        : dev+' is following '+(j.group||'a group')+'. Pick the group to see and control it.';
+        ? devName+' is leading '+(j.group||'a group')+'. Pick the group to see and control it.'
+        : devName+' is following '+(j.group||'a group')+'. Pick the group to see and control it.';
     } else msg('');
   }catch(e){ msg(e.message,'err'); }
 }
 
 /* QUEUE_LOAD replaces the whole queue on the speaker - the one destructive
    operation - so anything that triggers it asks first when a queue is live. */
-let QTOTAL=0;
+let QTOTAL=0, CURRENT_PROTOCOL=null, QSHUFFLE=false;
 function confirmReplace(what, go){
   if(QTOTAL<2) return go();
   $('msg').innerHTML=`<div class="msg err" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -494,11 +497,12 @@ $('go').onclick=async()=>{
   confirmReplace('Casting this link', ()=>doCast(url,device));
 };
 async function doCast(url,device){
-  $('go').disabled=true; msg('extracting audio-only stream & casting…');
+  const deviceName=(DEVS.find(d=>(d.key||d.name)===device)||{}).name||device;
+  $('go').disabled=true; msg('extracting audio-only stream & sending…');
   try{
     const j=await api('/api/cast',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({url,device})});
-    msg(`casting to ${device}`,'ok');
+    msg(`playing on ${deviceName}`,'ok');
     if(j.media&&j.media.video_id&&$('showvid').checked) mountVideo(j.media.video_id);
     $('title').textContent=j.media.title||'';
   }catch(e){ msg(e.message,'err'); }
@@ -858,9 +862,12 @@ $('next').onclick=()=>skip(1);
 $('shuffle').title='Shuffle the queue now';
 $('shuffle').onclick=async()=>{
   if(QTOTAL<2) return tmsg('nothing queued to shuffle','err');
-  $('shuffle').disabled=true; tmsg('shuffling…');
+  const sticky=CURRENT_PROTOCOL==='sonos', enable=sticky?!QSHUFFLE:true;
+  $('shuffle').disabled=true; tmsg(sticky?(enable?'turning shuffle on…':'turning shuffle off…'):'shuffling…');
   try{ await api('/api/queue/mode',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({shuffle:true})}); QV=-1; tmsg('queue shuffled','ok');
+    body:JSON.stringify({shuffle:enable})}); QV=-1;
+    if(sticky){QSHUFFLE=enable;$('shuffle').classList.toggle('on',enable);}
+    tmsg(sticky?(enable?'shuffle on':'shuffle off'):'queue shuffled','ok');
     setTimeout(()=>tmsg(''),2000); }
   catch(e){ tmsg(e.message,'err'); }
   $('shuffle').disabled=false;
@@ -970,13 +977,10 @@ $('plqueue').onclick=async()=>{
 async function tick(){
   try{
     const s=await api('/api/status');
-    if(!s.connected){
-      clearVideo('Not connected to a speaker yet. Pick one above.');
-      QTOTAL=0; renderQueue(null);
-    }
     if(!s.connected){ clearVideo('Not connected to a speaker yet. Pick one above.');
-                      QTOTAL=0; renderQueue(null); }
+                      QTOTAL=0; CURRENT_PROTOCOL=null; QSHUFFLE=false; renderQueue(null); }
     if(s.connected){
+      CURRENT_PROTOCOL=s.protocol||'cast';
       $('state').textContent=s.state||'—';
       $('dot').className='dot '+(s.state==='PLAYING'?'on':s.state==='BUFFERING'?'buf':'');
       $('rebuf').textContent=s.rebuffers??0;
@@ -1008,6 +1012,10 @@ async function tick(){
         $('vol').value=Math.round(s.volume*100);
       updateLink(s.media && s.media.video_id, pos);
       const q=s.queue;
+      QSHUFFLE=!!(q&&q.shuffle);
+      $('shuffle').classList.toggle('on',CURRENT_PROTOCOL==='sonos'&&QSHUFFLE);
+      $('shuffle').title=CURRENT_PROTOCOL==='sonos'
+        ? (QSHUFFLE?'Turn shuffle off':'Turn shuffle on') : 'Shuffle the queue now';
       $('prev').disabled = !(q && q.can_prev);
       $('next').disabled = !(q && q.can_next);
       renderQueue(q);
@@ -1029,6 +1037,8 @@ async function tick(){
       else if(s.media&&!s.media.video_id&&s.media.identified&&s.media.identified.confidence==='none')
         $('noplayer').textContent="Couldn't identify this stream, so there's no video to show. "
           +"Audio controls still work. Cast a link here to get the synced video.";
+      else if(!s.media&&s.state==='IDLE')
+        clearVideo((s.device_name||'The speaker')+' is idle. Play a link or playlist to start.');
       if(YT_PLAYER&&YT_PLAYER.getCurrentTime&&$('showvid').checked&&!SYNCING
          &&!scrubbing&&!seekLock){
         const local=YT_PLAYER.getCurrentTime()||0;
