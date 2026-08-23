@@ -26,6 +26,9 @@ jobs:
         with: { node-version: 22, cache: npm }
       - run: npm ci
 
+      - name: Unit tests
+        run: npm test
+
       # 1. the headless server: this is where mDNS binds udp/5353, the step most
       #    likely to behave differently on Windows
       - name: Server starts and answers
@@ -49,7 +52,7 @@ jobs:
           npx electron . --no-sandbox > electron.log 2>&1 &
           PORT=""
           for i in $(seq 1 45); do
-            PORT=$(grep -oE '127\.0\.0\.1:[0-9]+' electron.log 2>/dev/null | head -1 | cut -d: -f2)
+            PORT=$(grep -oE '127\.0\.0\.1:[0-9]+' electron.log 2>/dev/null | head -1 | cut -d: -f2 || true)
             if [ -n "$PORT" ] && curl -sf --max-time 3 "http://127.0.0.1:$PORT/" >/dev/null; then
               echo "app served its UI on port $PORT after ${i}s"; break; fi
             sleep 1
