@@ -100,9 +100,9 @@ jobs:
           sleep 2
           npx electron-builder --dir --publish never 2>&1 | tail -3
           if [ "$RUNNER_OS" = "Windows" ]; then
-            BIN=$(find dist -maxdepth 2 -name '*.exe' -path '*unpacked*' | head -1)
+            BIN=$(find dist -name '*.exe' -path '*unpacked*' | head -1)
           else
-            BIN=$(find dist -maxdepth 4 -path '*.app/Contents/MacOS/*' -type f | head -1)
+            BIN=$(find dist -path '*.app/Contents/MacOS/*' -type f -perm -u+x | head -1)
           fi
           echo "packaged binary: $BIN"
           [ -n "$BIN" ] || { echo "NO PACKAGED BINARY FOUND"; ls -R dist | head -30; exit 1; }
