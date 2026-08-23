@@ -27,11 +27,26 @@ unnoticed — and you can close the window entirely and the music keeps playing.
 Meanwhile the app keeps the video on your screen lined up with what the speaker is
 playing, so you can watch along.
 
+## The music keeps playing without the app
+
+The list of what's playing next lives **on the speaker**, not in this app. So you
+can close the window, quit the app, or shut the laptop, and the speaker carries on
+by itself and moves to the next track on its own.
+
+It also means the queue is shared. Open the app on another computer on the same
+network and it finds whatever is playing and shows you the same list — no setting
+up, no accounts, nothing to sync. Either computer can skip, shuffle or add tracks
+and the other sees it.
+
+Saved playlists are still kept on each computer separately; it's the playing queue
+that's shared.
+
 ## What you can do
 
 - Send any YouTube video's audio to a speaker or speaker group
 - Watch the video while you listen, automatically kept in step
 - Build playlists, shuffle them, repeat one track or the whole thing
+- Walk away — the speaker keeps going, and picks up the next track itself
 - Queue up more videos on the fly, without editing a playlist
 - Drop the video into theater mode or true fullscreen
 - Copy a link to whatever's playing, optionally starting at the current moment
