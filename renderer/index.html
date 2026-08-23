@@ -54,6 +54,22 @@ button:disabled{opacity:.45;cursor:default}
 .time{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);
   font-variant-numeric:tabular-nums}
 .msg{font-size:13px;padding:10px 12px;border-radius:8px;margin-top:10px}
+/* Building a queue means one yt-dlp call per track, about ten seconds each, so
+   a ten track playlist keeps arriving for over a minute. Without a marker the
+   list just looks short and finished. */
+#qfill{display:flex;align-items:center;gap:8px;padding:8px 10px;font-size:12px;opacity:.75}
+#qfill.hide{display:none}
+.spin{width:12px;height:12px;flex:none;border-radius:50%;
+  border:2px solid currentColor;border-top-color:transparent;
+  animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spin{animation-duration:2.4s}}
+/* A speaker that is only making sound because a group told it to. Informational
+   - deliberately not styled as an error, because nothing is wrong. */
+#groupnote{font-size:13px;padding:9px 12px;border-radius:8px;margin-top:10px;
+  background:rgba(66,133,244,.12);border:1px solid rgba(66,133,244,.28);line-height:1.5}
+#groupnote.hide{display:none}
+#groupnote a{color:inherit;text-decoration:underline;cursor:pointer}
 .msg.err{background:rgba(217,48,37,.12);color:var(--warn)}
 .msg.ok{background:rgba(15,157,88,.12);color:var(--ok)}
 .meta{font-size:12.5px;color:var(--muted);margin-top:10px;word-break:break-word}
@@ -152,6 +168,7 @@ button.mini.done{background:var(--ok)}
       <button class="ghost" id="rescan" title="Re-scan for devices" aria-label="Re-scan for devices"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg></button>
     </div>
     <div id="msg"></div>
+    <div id="groupnote" class="hide"></div>
   </div>
 
   <div class="card" id="playercard">
@@ -173,7 +190,7 @@ button.mini.done{background:var(--ok)}
           <button class="ghost" id="play">▶︎ Play</button>
           <button class="ghost" id="pause">❚❚ Pause</button>
           <button class="ghost ic" id="next" title="Next track"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 4 15 12 5 20"/><line x1="19" y1="5" x2="19" y2="19"/></svg></button>
-          <button class="ghost" id="stop">■ Stop</button>
+          <button class="ghost" id="stop" title="Stop playing and release the speaker">■ Stop</button>
           <button class="ghost ic tog" id="shuffle" title="Shuffle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg></button>
           <button class="ghost ic tog" id="repeat" title="Repeat: off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg><b id="repone">1</b></button>
           <button class="ghost" id="refresh" title="Re-issue an expired CDN url and resume">↻ Refresh stream</button>
@@ -203,6 +220,7 @@ button.mini.done{background:var(--ok)}
       <aside class="pside" id="queueside">
         <div class="qhead"><span>Up next</span><span id="qmeta"></span></div>
         <div id="qitems"></div>
+        <div id="qfill" class="hide"><span class="spin"></span><span id="qfilltext"></span></div>
       </aside>
     </div>
   </div>
@@ -281,22 +299,6 @@ function showLoading(on){
   else  { $('vidload').classList.add('hide'); }
 }
 
-function clearVideo(reason){
-  WAITVID=null; showLoading(false);
-  if(CUR_VID){
-    CUR_VID=null;
-    try{ if(YT_PLAYER&&YT_PLAYER.stopVideo) YT_PLAYER.stopVideo(); }catch(e){}
-  }
-  $('playerwrap').classList.add('hide');
-  $('noplayer').classList.remove('hide');
-  $('noplayer').textContent = reason;
-  updateLink(null,0);
-  $('title').textContent='';
-  DUR=0; paintBar(0); $('tcur').textContent='0:00'; $('tdur').textContent='0:00';
-  $('state').textContent='idle'; $('dot').className='dot';
-  $('recv').textContent='—'; $('codec').textContent='—';
-}
-
 /* Nothing ever un-mounted the player, so switching to an idle speaker left the
    previous device's video happily playing. */
 function clearVideo(reason){
@@ -316,7 +318,15 @@ function clearVideo(reason){
 function mountVideo(vid){
   if(!vid) return;
   if(!YT_READY){ PENDING_VID=vid; clog('mount deferred, api not ready: '+vid); return; }
-  if(vid===CUR_VID && YT_PLAYER) return;
+  /* Already showing this one. The spinner can still be up: a skip whose
+     response came back AFTER the speaker had already moved on turns loading
+     back on for a video that is by then mounted. Returning early without
+     clearing it is what left "loading track..." on screen for good. */
+  if(vid===CUR_VID && YT_PLAYER){
+    showLoading(false);
+    $('playerwrap').classList.remove('hide'); $('noplayer').classList.add('hide');
+    return;
+  }
   CUR_VID=vid;
   showLoading(false);
   $('playerwrap').classList.remove('hide'); $('noplayer').classList.add('hide');
@@ -334,11 +344,47 @@ function mountVideo(vid){
 async function api(p,o){const r=await fetch(p,o);let j={};try{j=await r.json()}catch(e){}
   if(!r.ok) throw new Error(j.error||('HTTP '+r.status)); return j;}
 
-const deviceOptions = ds => ds.map(d=>{
+/* Remembered so the note under the picker can be redrawn on selection without
+   another round trip. */
+let DEVS = [];
+const PICK_NONE = '<option value="">Pick a speaker…</option>';
+/* A <select> always has something selected, so without this the first speaker
+   in the list reads as a remembered default. Nothing is remembered - the empty
+   option is what "no choice yet" actually looks like. */
+const deviceOptions = ds => { DEVS = ds || [];
+  /* empty string when there is nothing, so callers can still fall back to
+     their own "no speakers found" message */
+  if (!DEVS.length) return '';
+  return PICK_NONE + DEVS.map(d=>{
   const kind = d.is_group ? 'group' : (d.audio_only ? 'speaker' : 'video');
-  const busy = d.busy ? ' ▸ ' + (d.status_text || 'playing').slice(0,28) : '';
+  /* A speaker playing as part of a group is busy in exactly the way a speaker
+     playing alone is busy - naming the group is the only way to tell them
+     apart, so say that instead of echoing the track title. */
+  const busy = d.in_group
+    ? ' ▸ in ' + d.in_group.name + (d.in_group.role === 'leader' ? ' (master)' : '')
+    : (d.busy ? ' ▸ ' + (d.status_text || 'playing').slice(0,28) : '');
   return `<option value="${esc(d.name)}">${esc(d.name)} — ${kind}${esc(busy)}</option>`;
-}).join('');
+}).join(''); };
+
+/* Explain a speaker that is only making sound because a group told it to.
+   Picking one and seeing no video is otherwise baffling. */
+function groupNote(){
+  const el = $('groupnote'); if(!el) return;
+  const d = DEVS.find(x => x.name === $('device').value);
+  const g = d && d.in_group;
+  if(!g){ el.classList.add('hide'); el.innerHTML=''; return; }
+  el.classList.remove('hide');
+  const link = ' <a href="#" data-switch>Control the group instead</a>';
+  el.innerHTML = (g.role === 'leader'
+    ? esc(d.name)+' is the <b>master</b> of <b>'+esc(g.name)+'</b> — it plays for the whole group.'
+    : esc(d.name)+' is playing as part of <b>'+esc(g.name)+'</b>, following its master.'
+      +' There is no separate stream here to control.') + link;
+  /* looked up through the container, not by id: the anchor only exists once
+     this has rendered, and a bare id lookup would read as a dangling reference */
+  const a = el.querySelector('a[data-switch]');
+  if(a) a.onclick = e => { e.preventDefault(); $('device').value = g.name;
+                           groupNote(); attach(); };
+}
 
 /* The window is hidden rather than destroyed when toggled from the tray, so the
    page can live for hours without reloading. Re-sync the device list on a timer
@@ -346,7 +392,7 @@ const deviceOptions = ds => ds.map(d=>{
 async function syncDevices(){
   try{
     const j=await api('/api/devices');
-    const html=deviceOptions(j.devices);
+    const html=deviceOptions(j.devices);   // also refreshes DEVS for groupNote()
     if(html && html!==$('device').innerHTML){
       const keep=$('device').value;
       $('device').innerHTML=html;
@@ -354,6 +400,7 @@ async function syncDevices(){
       else if(j.connected) $('device').value=j.connected;
       clog('device list updated ('+j.devices.length+')');
     }
+    groupNote();          // membership changes as groups start and stop
   }catch(e){}
 }
 let devSyncs=0;
@@ -376,7 +423,7 @@ async function loadDevices(refresh){
        mDNS reports which speakers are busy, so this needs nothing stored. */
     const pick = j.connected || j.active;
     const have = pick && [...$('device').options].some(o=>o.value===pick);
-    if(have){ $('device').value=pick; attach(); msg(''); }
+    if(have){ $('device').value=pick; groupNote(); attach(); msg(''); }
     else if(j.active_count>1){
       msg('more than one speaker is playing — pick the one you want','ok');
     }
@@ -416,6 +463,13 @@ async function attach(){
     } else if(j.adopted){          // adopted but not yet identified - tick() may still mount
       msg('attached to the session playing on '+dev,'ok');
       $('noplayer').textContent='Working out what is playing…';
+    } else if(j.group_role){     // it is singing, but as one voice in a group
+      clearVideo();
+      msg(dev+' is playing as part of '+(j.group||'a speaker group')+
+          (j.group_role==='leader'?' (it is the master)':''),'ok');
+      $('noplayer').textContent = j.group_role==='leader'
+        ? dev+' is leading '+(j.group||'a group')+'. Pick the group to see and control it.'
+        : dev+' is following '+(j.group||'a group')+'. Pick the group to see and control it.';
     } else msg('');
   }catch(e){ msg(e.message,'err'); }
 }
@@ -436,6 +490,7 @@ function confirmReplace(what, go){
 $('go').onclick=async()=>{
   const url=$('url').value.trim(), device=$('device').value;
   if(!url) return msg('paste a link first','err');
+  if(!device) return msg('pick a speaker first','err');
   confirmReplace('Casting this link', ()=>doCast(url,device));
 };
 async function doCast(url,device){
@@ -451,10 +506,25 @@ async function doCast(url,device){
 }
 $('url').addEventListener('keydown',e=>{if(e.key==='Enter')$('go').click()});
 $('rescan').onclick=()=>loadDevices(true);
-$('device').onchange=()=>attach();
-for(const a of ['play','pause','stop','refresh'])
+$('device').onchange=()=>{ groupNote(); attach(); };
+for(const a of ['play','pause','refresh'])
   $(a).onclick=()=>api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({action:a})}).catch(e=>msg(e.message,'err'));
+/* Stop quits the receiver rather than just silencing it, so the speaker goes
+   back to idle instead of sitting there looking busy. The queue lives on the
+   speaker, so stopping throws it away - worth a word before it happens. */
+$('stop').onclick=()=>confirmReplace('Stopping', async()=>{
+  $('stop').disabled=true;
+  try{
+    await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'stop'})});
+    clearVideo('Stopped. Pick a speaker and cast a link to start again.');
+    msg('stopped — the speaker is free again','ok');
+    syncDevices();
+  }catch(e){ msg(e.message,'err'); }
+  finally{ $('stop').disabled=false; }
+});
+
 $('vol').onchange=e=>api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({action:'volume',value:e.target.value/100})}).catch(()=>{});
 $('showvid').onchange=e=>{
@@ -773,7 +843,11 @@ function applySkipView(j){
       /* Mounting the new video now would leave it running against a speaker
          still on the old track. Hold a spinner until the speaker catches up. */
   WAITVID=j.item.video_id||null;
-  if($('showvid').checked) showLoading(true);
+  /* Only spin when there is something to wait for. Already on that video means
+     nothing to wait for, and an item we cannot identify would spin forever
+     because the tick that clears this only runs when WAITVID is set. */
+  if(WAITVID && WAITVID!==CUR_VID && $('showvid').checked) showLoading(true);
+  else if(!WAITVID) showLoading(false);
   updateLink(WAITVID,0);
   if(typeof j.pos==='number') highlightQueue(j.pos, j.total);
 }
@@ -836,9 +910,10 @@ function highlightQueue(pos,total){
 async function renderQueue(q){
   /* the panel only earns its space when something is actually queued behind
      the current track */
-  document.body.classList.toggle('noqueue', !(q && q.total > 1));
-  if(!q || q.total<2){ QV=-1; QITEMS=[]; LASTQPOS=-1;
-    $('qitems').innerHTML=''; $('qmeta').textContent=''; return; }
+  const filling = !!(q && q.filling && q.filling.total);
+  document.body.classList.toggle('noqueue', !(q && (q.total > 1 || filling)));
+  if(!q || (q.total<2 && !filling)){ QV=-1; QITEMS=[]; LASTQPOS=-1;
+    $('qitems').innerHTML=''; $('qmeta').textContent=''; fillNote(null); return; }
   if(q.version!==QV){
     try{ const j=await api('/api/queue');
       if(j && j.items){ QITEMS=j.items; QV=q.version; LASTQPOS=-1;
@@ -851,7 +926,18 @@ async function renderQueue(q){
     }catch(e){ return; }
   }
   highlightQueue(q.pos,q.total);
+  fillNote(q.filling);
 }
+
+/* "3 of 10" while the rest are still being fetched, so a part-built queue does
+   not read as a complete one. */
+function fillNote(f){
+  const el=$('qfill'); if(!el) return;
+  if(!f || !f.total){ el.classList.add('hide'); return; }
+  el.classList.remove('hide');
+  $('qfilltext').textContent = `adding ${f.total - f.done} more…`;
+}
+
 $('qitems').addEventListener('click', async e=>{
   const row=e.target.closest('.qi'); if(!row) return;
   const pos=+row.dataset.qpos;

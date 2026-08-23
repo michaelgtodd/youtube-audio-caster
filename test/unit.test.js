@@ -134,3 +134,169 @@ test('cdn token survives a re-issued url for the same stream', () => {
   assert.strictEqual(hit.video_id, 'ccccccccccc');
   assert.strictEqual(hit.matched_on, 'cdn_token');
 });
+
+/* A Cast GROUP strips customData off queue items. Measured on a real group:
+   item.customData and item.media.customData both come back undefined while
+   metadata.title and metadata.images survive. If describe() cannot recover the
+   video id, refreshExpiring skips every item for want of a url and playback
+   dies at the six hour expiry - silently, and only on groups. */
+const groupItem = (thumbUrl, extra = {}) => ({
+  itemId: 7,
+  media: {
+    contentId: 'https://rr2---sn-x.googlevideo.com/videoplayback?expire=1787519335&itag=140',
+    contentType: 'audio/mp4', streamType: 'BUFFERED', duration: 8150.6,
+    metadata: { type: 0, metadataType: 3, title: 'Lofi Cat Mix',
+      images: thumbUrl ? [{ url: thumbUrl }] : [] },
+    ...extra,
+  },
+});
+
+test('REGRESSION: a group strips customData, so identity comes from the thumbnail', () => {
+  const d = CQ.describe(groupItem('https://i.ytimg.com/vi/I5noeDaJaFQ/maxresdefault.jpg'));
+  assert.strictEqual(d.video_id, 'I5noeDaJaFQ');
+  assert.strictEqual(d.url, 'https://www.youtube.com/watch?v=I5noeDaJaFQ');
+  assert.strictEqual(d.thumb, 'https://i.ytimg.com/vi/I5noeDaJaFQ/mqdefault.jpg');
+  assert.strictEqual(d.title, 'Lofi Cat Mix');
+  assert.strictEqual(d.expires, 1787519335);
+  // duration must fall back to media.duration, since customData carried it before
+  assert.strictEqual(d.duration, 8150.6);
+});
+
+test('a url is recoverable for refresh on a group item, or expiry kills playback', () => {
+  const d = CQ.describe(groupItem('https://i.ytimg.com/vi/I5noeDaJaFQ/maxresdefault.jpg'));
+  // refreshExpiring filters on `i.url` - a null here means the item is skipped
+  assert.ok(d.url, 'group items must yield a url or they never get refreshed');
+});
+
+test('idFromImages handles webp thumbnails and refuses junk', () => {
+  assert.strictEqual(CQ.idFromImages({ images: [{ url: 'https://i.ytimg.com/vi_webp/aqz-KE-bpKQ/hq720.webp' }] }), 'aqz-KE-bpKQ');
+  assert.strictEqual(CQ.idFromImages({ images: [{ url: 'https://example.com/cover.jpg' }] }), null);
+  assert.strictEqual(CQ.idFromImages({ images: [] }), null);
+  assert.strictEqual(CQ.idFromImages({}), null);
+  assert.strictEqual(CQ.idFromImages(null), null);
+});
+
+test('customData still wins when it survives, so single speakers are unchanged', () => {
+  const it = groupItem('https://i.ytimg.com/vi/WRONGIDWRON/maxresdefault.jpg', {
+    customData: { video_id: 'I5noeDaJaFQ', page: 'https://youtu.be/I5noeDaJaFQ' },
+  });
+  const d = CQ.describe(it);
+  assert.strictEqual(d.video_id, 'I5noeDaJaFQ');
+  assert.strictEqual(d.url, 'https://youtu.be/I5noeDaJaFQ', 'the stored page url must win');
+});
+
+test('item() always leaves a thumbnail the video id can be read back out of', () => {
+  // yt-dlp thumbnails already carry the id, so nothing extra is added
+  const withThumb = CQ.item(
+    { url: 'u', ctype: 'audio/mp4', title: 'T', duration: 10,
+      thumb: 'https://i.ytimg.com/vi/I5noeDaJaFQ/maxresdefault.jpg' },
+    { video_id: 'I5noeDaJaFQ', url: 'p' });
+  assert.strictEqual(withThumb.media.metadata.images.length, 1);
+  assert.strictEqual(CQ.idFromImages(withThumb.media.metadata), 'I5noeDaJaFQ');
+
+  // no thumbnail, or an unusable one: a canonical image is appended so a group
+  // still has something to recover the id from
+  for (const thumb of [null, 'https://example.com/art.jpg']) {
+    const it = CQ.item({ url: 'u', ctype: 'audio/mp4', title: 'T', duration: 10, thumb },
+      { video_id: 'I5noeDaJaFQ', url: 'p' });
+    assert.strictEqual(CQ.idFromImages(it.media.metadata), 'I5noeDaJaFQ',
+      `id must survive a group when thumb=${thumb}`);
+  }
+});
+
+/* Group membership. A follower is indistinguishable from a solo speaker over
+   mDNS (both advertise st=1 and rs="Casting: ..."), so the role has to come
+   from the group's own member list plus who is hosting the group endpoint. */
+const GRP = require('../castgroups.js');
+
+test('device ids match across mDNS and multizone despite the dashes', () => {
+  assert.strictEqual(GRP.dashId('f1c05002535f85c0c31273ff6a43e77a'),
+                     'f1c05002-535f-85c0-c312-73ff6a43e77a');
+  // already dashed, or odd length: passed through lowercased, never mangled
+  assert.strictEqual(GRP.dashId('f1c05002-535f-85c0-c312-73ff6a43e77a'),
+                     'f1c05002-535f-85c0-c312-73ff6a43e77a');
+  assert.strictEqual(GRP.dashId(null), '');
+});
+
+test('the receiver app id says whether a speaker is solo, leading or following', () => {
+  assert.strictEqual(GRP.roleFromAppId('531A4F84'), 'leader');
+  assert.strictEqual(GRP.roleFromAppId('705D30C6'), 'member');
+  assert.strictEqual(GRP.roleFromAppId('CC1AD845'), null);   // ordinary solo playback
+  assert.strictEqual(GRP.roleFromAppId(undefined), null);
+});
+
+test('annotate marks group members, and the host match picks out the leader', () => {
+  const devices = [
+    { name: 'Storage', id: 'f1c05002535f85c0c31273ff6a43e77a', host: '10.6.162.114', is_group: false },
+    { name: 'Office',  id: '16c4e6bf497084a2fe686cd4e9a8cc85', host: '10.4.162.12',  is_group: false },
+    { name: 'Lonely',  id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', host: '10.4.9.9',     is_group: false },
+    { name: 'World',   id: 'c3d20291-c931-46b7-bd96-d2e6c0aea6d0', host: '10.6.162.114', is_group: true },
+  ];
+  // the group endpoint is hosted BY the leader, so hosts match for exactly one member
+  const map = GRP.annotate(devices, [{ group: 'World', host: '10.6.162.114', playing: true, members: [
+    { deviceId: 'f1c05002-535f-85c0-c312-73ff6a43e77a' },
+    { deviceId: '16c4e6bf-4970-84a2-fe68-6cd4e9a8cc85' },
+  ]}]);
+  assert.deepStrictEqual(map.get('Storage'), { group: 'World', role: 'leader' });
+  assert.deepStrictEqual(map.get('Office'),  { group: 'World', role: 'member' });
+  assert.strictEqual(map.get('Lonely'), undefined, 'a speaker outside the group is untouched');
+  assert.strictEqual(map.get('World'), undefined, 'the group itself is not its own member');
+});
+
+test('annotate survives a group that answers with nothing', () => {
+  const devices = [{ name: 'A', id: 'a'.repeat(32), host: '10.0.0.1', is_group: false }];
+  assert.strictEqual(GRP.annotate(devices, []).size, 0);
+  assert.strictEqual(GRP.annotate(devices, [{ group: 'G', host: '10.0.0.9', playing: true, members: [] }]).size, 0);
+  assert.strictEqual(GRP.annotate(devices, null).size, 0);
+  assert.strictEqual(GRP.annotate(devices, [null]).size, 0);
+});
+
+/* A group lists its members whether or not it is doing anything, so membership
+   alone cannot mean "playing in a group". mDNS is no help either: a speaker
+   that stopped minutes ago can still advertise st=1. Only the group's own
+   playbackSession says it is actually playing. */
+test('REGRESSION: an idle group must not label its members as playing', () => {
+  const devices = [
+    { name: 'Storage', id: 'f1c05002535f85c0c31273ff6a43e77a', host: '10.6.162.114', is_group: false },
+    { name: 'Office',  id: '16c4e6bf497084a2fe686cd4e9a8cc85', host: '10.4.162.12',  is_group: false },
+  ];
+  const members = [
+    { deviceId: 'f1c05002-535f-85c0-c312-73ff6a43e77a' },
+    { deviceId: '16c4e6bf-4970-84a2-fe68-6cd4e9a8cc85' },
+  ];
+  const idle = GRP.annotate(devices, [{ group: 'World', host: '10.6.162.114', playing: false, members }]);
+  assert.strictEqual(idle.size, 0, 'an idle group must claim nobody');
+
+  // a report with no playing field at all is treated as not playing, never as playing
+  const unknown = GRP.annotate(devices, [{ group: 'World', host: '10.6.162.114', members }]);
+  assert.strictEqual(unknown.size, 0, 'absent playbackSession must not read as playing');
+
+  // and the same group, playing, still labels both
+  const live = GRP.annotate(devices, [{ group: 'World', host: '10.6.162.114', playing: true, members }]);
+  assert.strictEqual(live.size, 2);
+});
+
+/* `playbackSession` in the multizone status is NOT a "playing" signal. Measured
+   on a real speaker sitting idle with the Default Media Receiver still loaded:
+   playbackSession=true while the media namespace reported status:[] - nothing
+   loaded at all. Believing it left idle speakers advertising a stale
+   "Default Media Receiver" line in the picker and miscounting auto-attach. */
+test('REGRESSION: a loaded but idle receiver is not playing', () => {
+  // an app is up, but nothing has been loaded into it
+  assert.strictEqual(GRP.playingFromMediaStatus([]), false);
+  assert.strictEqual(GRP.playingFromMediaStatus(undefined), false);
+  assert.strictEqual(GRP.playingFromMediaStatus([{ playerState: 'IDLE' }]), false);
+  // finished the queue: state goes IDLE while the last media lingers
+  assert.strictEqual(GRP.playingFromMediaStatus(
+    [{ playerState: 'IDLE', idleReason: 'FINISHED', media: { contentId: 'x' } }]), false);
+});
+
+test('playing and paused both count as occupied', () => {
+  assert.strictEqual(GRP.playingFromMediaStatus(
+    [{ playerState: 'PLAYING', media: { contentId: 'x' } }]), true);
+  assert.strictEqual(GRP.playingFromMediaStatus(
+    [{ playerState: 'BUFFERING', media: { contentId: 'x' } }]), true);
+  // a paused speaker is still someone's speaker - do not offer it as free
+  assert.strictEqual(GRP.playingFromMediaStatus(
+    [{ playerState: 'PAUSED', media: { contentId: 'x' } }]), true);
+});

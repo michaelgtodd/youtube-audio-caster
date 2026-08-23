@@ -20,11 +20,37 @@ const REFRESH_BELOW = 2 * 3600;   // rewrite urls with less than this left
 const REPEAT = { off: 'REPEAT_OFF', all: 'REPEAT_ALL', one: 'REPEAT_SINGLE' };
 const expiryOf = u => { const m = String(u || '').match(/[?&]expire=(\d+)/); return m ? +m[1] : null; };
 
+/* A Cast GROUP strips customData off every queue item - metadata survives, ours
+   does not. Measured on a real group: item.customData and item.media.customData
+   both come back undefined while metadata.title and metadata.images are intact.
+   The video id is still recoverable because it sits inside the thumbnail url,
+   so identity rides along in a field the group does keep. Without this the
+   group queue has no ids, refreshExpiring skips every item for want of a url,
+   and playback dies at the six hour expiry. */
+const YTID = /\/vi(?:_webp)?\/([A-Za-z0-9_-]{11})\//;
+const idFromImages = md => {
+  for (const im of ((md && md.images) || [])) {
+    const m = YTID.exec((im && im.url) || '');
+    if (m) return m[1];
+  }
+  return null;
+};
+const thumbFor = id => `https://i.ytimg.com/vi/${id}/mqdefault.jpg`;
+
+/* Always leave at least one image whose url carries the video id, so a group
+   that drops customData can still be read back. yt-dlp thumbnails already look
+   like .../vi/<id>/maxresdefault.jpg, so usually nothing extra is added. */
+const imagesFor = (thumb, videoId) => {
+  const out = thumb ? [{ url: thumb }] : [];
+  if (videoId && !out.some(i => YTID.test(i.url))) out.push({ url: thumbFor(videoId) });
+  return out;
+};
+
 const item = (m, entry) => ({
   media: {
     contentId: m.url, contentType: m.ctype, streamType: 'BUFFERED',
     metadata: { type: 0, metadataType: 3, title: m.title,
-      images: m.thumb ? [{ url: m.thumb }] : [] },
+      images: imagesFor(m.thumb, entry.video_id) },
     customData: { video_id: entry.video_id, page: entry.url },
   },
   autoplay: true, preloadTime: 15,
@@ -54,15 +80,19 @@ async function readQueue(player) {
 const describe = it => {
   const cd = it.customData || (it.media && it.media.customData) || {};
   const md = (it.media && it.media.metadata) || {};
+  /* video_id from the item itself when we have it, otherwise out of the
+     thumbnail url - the group case, where customData is gone */
+  const vid = cd.video_id || idFromImages(md);
   return {
     itemId: it.itemId,
-    video_id: cd.video_id || null,
-    url: cd.page || (cd.video_id ? 'https://www.youtube.com/watch?v=' + cd.video_id : null),
+    video_id: vid,
+    url: cd.page || (vid ? 'https://www.youtube.com/watch?v=' + vid : null),
     title: cd.title || md.title || '(unknown)',
-    duration: cd.duration ?? null,
-    thumb: cd.video_id ? `https://i.ytimg.com/vi/${cd.video_id}/mqdefault.jpg` : null,
+    duration: cd.duration ?? (it.media && it.media.duration) ?? null,
+    thumb: vid ? thumbFor(vid) : null,
     expires: expiryOf(it.media && it.media.contentId),
   };
 };
 
-module.exports = { BATCH, HEAD, REFRESH_BELOW, REPEAT, expiryOf, item, rawReq, readQueue, describe };
+module.exports = { BATCH, HEAD, REFRESH_BELOW, REPEAT, expiryOf, idFromImages,
+  imagesFor, thumbFor, item, rawReq, readQueue, describe };

@@ -27,10 +27,18 @@ app.whenReady().then(async () => {
 
   /* Electron prints its own security advice about CSP and unsafe-eval on any
      unpackaged app. That is a note about this project's setup, not a fault in
-     the page, so it must not fail the run. */
+     the page, so it must not fail the run.
+
+     The embedded YouTube player also complains about browser features Electron
+     does not grant it - web-share, compute-pressure and friends. Which of these
+     appear varies from run to run, so counting them makes this test flaky about
+     something inside a third party iframe that we neither control nor care
+     about. Anything genuinely ours still fails the run. */
   const isElectronAdvice = m => /Electron Security Warning|unsafe-eval|Content-Security-Policy|consult/i.test(m);
+  const isIframeNoise = m => /Unrecognized feature|Permissions policy violation|allowed in this document/i.test(m);
   win.webContents.on('console-message', (_e, level, message) => {
-    if (level >= 2 && !isElectronAdvice(message)) problems.push('console: ' + message);
+    if (level >= 2 && !isElectronAdvice(message) && !isIframeNoise(message))
+      problems.push('console: ' + message);
   });
   win.webContents.on('render-process-gone', (_e, d) => problems.push('renderer gone: ' + d.reason));
   win.webContents.on('did-fail-load', (_e, code, desc) => problems.push(`load failed ${code} ${desc}`));
@@ -53,6 +61,44 @@ app.whenReady().then(async () => {
     out.title = document.title;
     return out;
   })()`);
+
+  /* The spinner that would not go away. A skip whose response comes back after
+     the speaker has already moved on turns loading back on for a video the tick
+     loop has by then mounted; mountVideo used to return early for the
+     already-mounted case without clearing it, leaving "loading track..." up for
+     good while audio played fine. Driven here against the real page. */
+  const spinner = await win.webContents.executeJavaScript(`(() => {
+    const vidload = document.getElementById('vidload');
+    const shown = () => !vidload.classList.contains('hide');
+    const out = {};
+    YT_PLAYER = YT_PLAYER || { loadVideoById(){}, mute(){} };   // stand in for the iframe
+    YT_READY = true;
+    CUR_VID = 'ALREADYMOUNT';
+
+    showLoading(true);
+    out.spinnerUpBefore = shown();
+    mountVideo('ALREADYMOUNT');            // the already-mounted path
+    out.clearedByMount = !shown();
+
+    // and the skip view must not raise it for a video already on screen
+    showLoading(false);
+    applySkipView({ item: { video_id: 'ALREADYMOUNT', title: 't' }, pos: 0, total: 3 });
+    out.notRaisedWhenSame = !shown();
+
+    // an unidentifiable item must not leave it spinning with nothing to wait for
+    CUR_VID = 'SOMETHINGELSE';
+    applySkipView({ item: { video_id: null, title: 't' }, pos: 0, total: 3 });
+    out.notRaisedWhenUnknown = !shown();
+    return out;
+  })()`);
+
+  for (const [k, msg] of [
+    ['spinnerUpBefore',      'test setup failed: spinner was not up to begin with'],
+    ['clearedByMount',       'mountVideo left the loading spinner up for an already-mounted video'],
+    ['notRaisedWhenSame',    'applySkipView raised the spinner for a video already on screen'],
+    ['notRaisedWhenUnknown', 'applySkipView spun forever for an item with no video id'],
+  ]) if (!spinner[k]) problems.push(msg);
+  console.log(`  video spinner    : ${Object.values(spinner).every(Boolean) ? 'clears correctly' : 'STUCK'}`);
 
   if (report.missingIds.length) problems.push('script references missing elements: ' + [...new Set(report.missingIds)].join(', '));
   if (report.missingCritical.length) problems.push('missing controls: ' + report.missingCritical.join(', '));

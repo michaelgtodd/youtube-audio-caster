@@ -12,16 +12,14 @@ const { Bonjour } = require('bonjour-service');
 const PL = require('./playlists.js');
 const CQ = require('./castqueue.js');
 const ID = require('./identity.js');
+const GRP = require('./castgroups.js');
 const { videoIdOf, isPlaylistUrl, cdnToken, expiryOf, remember, recall } = ID;
 
 const DMR_APP_ID = 'CC1AD845';
 const YTDLP = process.env.YTDLP || path.join(__dirname, 'bin', 'yt-dlp');
 const DATA_DIR = process.env.CASTAUDIO_DATA || __dirname;
 ID.setStorePath(path.join(DATA_DIR, 'sessions.json'));
-const SETTINGS = path.join(DATA_DIR, 'settings.json');
 PL.init(DATA_DIR);
-const loadSettings = () => { try { return JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); } catch { return {}; } };
-const saveSettings = o => { try { fs.writeFileSync(SETTINGS, JSON.stringify(o, null, 1)); } catch (e) { logErr(e); } };
 
 const S = {
   devices: [], client: null, player: null, device: null, host: null,
@@ -117,12 +115,74 @@ function addService(svc) {
   /* st=1 means the device has something loaded and rs is what it is, both
      straight from mDNS - so "which speaker is playing" needs no connection and
      no remembered preference. */
-  DEV.set(name, { name, model: txt.md || '?', host, port,
+  DEV.set(name, { name, id: txt.id || null, model: txt.md || '?', host, port,
     audio_only: !(ca & 1),                    // ca bit 0 = VIDEO_OUT
     is_group: /group/i.test(txt.md || '') || port !== 8009,
     busy: String(txt.st || '0') === '1',
     status_text: txt.rs || '',
     seen: Date.now() });
+}
+
+/* Which speakers are currently singing as part of a group, and which one is
+   leading. Only busy groups are asked, and the answer is cached briefly so the
+   device picker does not pay for a round of connections on every poll. */
+let groupCache = { at: 0, val: { inGroup: new Map(), groupPlaying: new Map() } };
+const GROUP_TTL = 8000;
+
+async function groupPlayback(devices) {
+  if (Date.now() - groupCache.at < GROUP_TTL) return groupCache.val;
+  /* Every group is asked, not just the ones mDNS calls busy. The st flag in a
+     TXT record goes stale - a speaker that stopped minutes ago can still be
+     advertising st=1 - and gating on it left members labelled as playing in a
+     group that had long since gone quiet. The group's own answer says whether
+     it is playing, so ask it and believe that instead. Groups are few and the
+     result is cached, so this costs little. */
+  const groups = devices.filter(d => d.is_group);
+  let inGroup = new Map();
+  const groupPlaying = new Map();
+  if (groups.length) {
+    const reports = await Promise.all(groups.map(async g => {
+      const r = await GRP.readMembers(g.host, g.port);
+      if (r.ok) groupPlaying.set(g.name, r.playing);
+      return { group: g.name, host: g.host, playing: r.playing, members: r.members };
+    }));
+    inGroup = GRP.annotate(devices, reports);
+  }
+  const val = { inGroup, groupPlaying };
+  groupCache = { at: Date.now(), val };
+  return val;
+}
+
+/* mDNS is not to be trusted about who is playing. A speaker that stopped keeps
+   advertising st=1 with its old status text until something re-announces, and
+   nothing here ever expires it - measured: a speaker running no app at all was
+   still advertising st=1 rs="Casting: ...". So ask the devices themselves. The
+   multizone namespace reports a playbackSession only while audio is actually
+   playing, confirmed on real hardware in both states.
+
+   Only audio devices are asked - a TV is never an auto-attach target and there
+   is no reason to go poking at one. A device that does not answer keeps
+   whatever mDNS said, so a slow speaker is never wrongly called idle. */
+let liveCache = { at: 0, map: new Map() };
+const LIVE_TTL = 8000;
+
+async function verifyPlaying(devices, groupPlaying) {
+  if (Date.now() - liveCache.at < LIVE_TTL) return liveCache.map;
+  const map = new Map();
+  const probes = [];
+  for (const d of devices) {
+    if (!d.audio_only) continue;
+    if (d.is_group) {                      // already answered by the group scan
+      if (groupPlaying.has(d.name)) map.set(d.name, groupPlaying.get(d.name));
+      continue;
+    }
+    probes.push(GRP.readPlayback(d.host, d.port)
+      .then(r => { if (r.ok) map.set(d.name, r.playing); })
+      .catch(() => {}));
+  }
+  await Promise.all(probes);
+  liveCache = { at: Date.now(), map };
+  return map;
 }
 
 function deviceList() {
@@ -215,8 +275,11 @@ async function identifyLive(rm) {
   const title = (rm.metadata && rm.metadata.title) || null;
   try {
     const cd = rm.customData || {};
-    if (cd.video_id) {                                   // the item describes itself
-      S.identity = { contentId, video_id: cd.video_id, confidence: 'exact' };
+    /* A group drops customData, but the id survives inside the thumbnail url,
+       so prefer that over falling through to a title fingerprint. */
+    const selfId = cd.video_id || CQ.idFromImages(rm.metadata);
+    if (selfId) {                                        // the item describes itself
+      S.identity = { contentId, video_id: selfId, confidence: 'exact' };
       return;
     }
     const hit = recall({ content_id: contentId, title, duration: rm.duration });
@@ -256,6 +319,26 @@ async function teardown() {
   S.client = null; S.player = null;
 }
 
+/* "Stop" has to actually mean stop. player.stop() only silences the media and
+   leaves the receiver app loaded, so the speaker keeps advertising st=1 with
+   rs="Default Media Receiver" - it looks busy in every picker and never returns
+   to idle. Quitting the session is what releases it, and since the queue lives
+   on the speaker that is also what clears the queue. */
+async function stopEverything() {
+  if (!S.player) return false;
+  try { await p(S.player, 'stop'); } catch {}            // silence it first
+  try { await p(S.client, 'stop', S.player); } catch {}  // then quit the receiver
+  S.qcache = null; S.identity = null; S.media = null;
+  S.srcUrl = null; S.expire = null; S.cdnUrl = null;
+  fillToken++; S.fill = null;              // stop means stop filling too
+  S.device = null; S.host = null;          // and stops being "the" speaker
+  groupCache = { at: 0, val: { inGroup: new Map(), groupPlaying: new Map() } };
+  liveCache = { at: 0, map: new Map() };    // both change the moment this lands
+  await teardown();
+  console.log('[stop] receiver quit, speaker released');
+  return true;
+}
+
 async function connectDevice(name) {
   console.log(`[connect] ${name}`);
   let dev = DEV.get(name);
@@ -285,9 +368,21 @@ async function attach(name) {
     await new Promise(r => setTimeout(r, 400));
   }
   if (!live) {
+    /* A speaker playing as part of a group runs the multizone leader or follower
+       app, not CC1AD845 - so there is nothing here to join. Say which group has
+       it rather than reporting a bare failure to adopt. */
+    const appId = sessions[0] && sessions[0].appId;
+    const role = GRP.roleFromAppId(appId);
+    let group = null;
+    if (role) {
+      try { const g = (await groupPlayback(deviceList())).inGroup.get(name); group = g ? g.group : null; }
+      catch (e) { logErr('group lookup: ' + e.message); }
+    }
     console.log(`[attach] no ${DMR_APP_ID} session after 3.2s (saw ${sessions.length}: ` +
-                `${sessions.map(x => x.appId).join(',') || 'none'})`);
-    return { adopted: false, app: sessions[0]?.displayName || null };
+                `${sessions.map(x => x.appId).join(',') || 'none'})` +
+                (role ? ` - ${name} is a group ${role}${group ? ' of ' + group : ''}` : ''));
+    return { adopted: false, app: sessions[0]?.displayName || null,
+             group_role: role, group };
   }
   console.log(`[attach] joined session ${live.sessionId.slice(0, 8)}`);
   const player = await p(client, 'join', live, DefaultMediaReceiver);
@@ -421,6 +516,7 @@ async function runJob(job) {
    urls before they expire. */
 
 S.fill = null;                    // progress of the background queue fill
+let fillToken = 0;                // bumped per load, so a stale fill stops itself
 
 const asCastItem = async entry => CQ.item(await extract(entry.url), entry);
 
@@ -475,18 +571,31 @@ async function loadQueue(entries, startIndex, opts) {
     h.customData.title, h.customData.duration, h.media.contentId, null));
 
   const rest = ordered.slice(CQ.HEAD);
+  /* Each play supersedes whatever was still being filled. Without this the old
+     fill keeps extracting and inserts its leftovers into the queue that
+     replaced it - and both fills write the same S.fill, which is how progress
+     ends up reading "8 of 7". */
+  const token = ++fillToken;
   S.fill = { done: 0, total: rest.length };
   (async () => {
-    const buf = [];
     for (const e of rest) {
-      try { buf.push(await asCastItem(e)); } catch (err) { logErr('fill: ' + err.message); }
-      S.fill.done++;
-      if (buf.length >= CQ.BATCH) { await insertBatched(buf.splice(0)); }
+      if (token !== fillToken) return;              // a newer queue took over
+      let item = null;
+      try { item = await asCastItem(e); } catch (err) { logErr('fill: ' + err.message); }
+      if (token !== fillToken) return;
+      S.fill = { done: S.fill.done + 1, total: rest.length };
+      /* Insert as soon as there is something to insert. Waiting to accumulate a
+         full batch meant nothing appeared until the entire playlist had been
+         extracted - about ten seconds a track, so over a minute of a ten track
+         playlist showing only its first three, which reads as broken. A batch
+         is a size ceiling for one message, not an amount worth waiting for. */
+      if (item) await insertBatched([item]);
     }
-    if (buf.length) await insertBatched(buf);
-    console.log(`[queue] fill complete (${S.fill.total} queued behind the head)`);
+    if (token !== fillToken) return;
+    console.log(`[queue] fill complete (${rest.length} queued behind the head)`);
     S.fill = null;
-  })().catch(e => { logErr('fill: ' + e.message); S.fill = null; });
+  })().catch(e => { logErr('fill: ' + e.message);
+                    if (token === fillToken) S.fill = null; });
 }
 
 /* Read the live queue off the speaker. getStatus only returns a 2-item window,
@@ -593,15 +702,32 @@ app.get('/api/devices', async (req, res) => {
         detail: S.discoveryError });
     }
     const devices = deviceList();
+    /* A speaker playing as part of a group looks identical over mDNS to one
+       playing alone - say which it is, so picking it is not a surprise. */
+    try {
+      const { inGroup, groupPlaying } = await groupPlayback(devices);
+      for (const d of devices) {
+        const g = inGroup.get(d.name);
+        d.in_group = g ? { name: g.group, role: g.role } : null;
+      }
+      /* Correct mDNS where the devices disagree with it, so "playing" means the
+         same thing in the picker, in the count, and to auto-attach. */
+      const live = await verifyPlaying(devices, groupPlaying);
+      for (const d of devices) {
+        if (!live.has(d.name)) continue;
+        d.busy = live.get(d.name);
+        if (!d.busy) d.status_text = '';
+      }
+    } catch (e) { logErr('group scan: ' + e.message); }
     /* Auto-attach only when exactly one audio-only speaker is busy - never to a
        video device, which would mean walking in on someone's film. */
-    const active = devices.filter(d => d.busy && d.audio_only);
-    res.json({ devices, connected: S.device, settled: settledOnce,
+    const active = devices.filter(d => d.busy && d.audio_only && !d.in_group);
+    res.json({ devices, connected: S.player ? S.device : null, settled: settledOnce,
                active: active.length === 1 ? active[0].name : null,
                active_count: active.length });
   } catch (e) {
     logErr(e);
-    res.json({ devices: deviceList(), connected: S.device, settled: true,
+    res.json({ devices: deviceList(), connected: S.player ? S.device : null, settled: true,
       active: null, active_count: 0, error: String(e.message || e) });
   }
 });
@@ -642,7 +768,7 @@ app.get('/api/status', async (req, res) => {
     const live = rm ? {
       title: liveTitle,
       duration: rm.duration ?? cd.duration ?? null,
-      video_id: cd.video_id || (ident && ident.video_id) || null,
+      video_id: cd.video_id || CQ.idFromImages(rm.metadata) || (ident && ident.video_id) || null,
       identified: ident ? { confidence: ident.confidence } : undefined,
       acodec: rm.contentType || null,
       abr: (S.media && S.media.abr) || null,
@@ -671,7 +797,7 @@ app.post('/api/control', async (req, res) => {
   try {
     if (action === 'play') await p(S.player, 'play');
     else if (action === 'pause') await p(S.player, 'pause');
-    else if (action === 'stop') await p(S.player, 'stop');
+    else if (action === 'stop') await stopEverything();
     else if (action === 'seek') await p(S.player, 'seek', Number(value) || 0);
     else if (action === 'volume') await p(S.client, 'setVolume', { level: Math.max(0, Math.min(1, Number(value))) });
     else if (action === 'refresh') await reissue('manual');
@@ -770,8 +896,8 @@ app.post('/api/queue/goto', asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/queue/stop', asyncRoute(async (req, res) => {
-  if (S.player) await p(S.player, 'stop').catch(() => {});
-  S.qcache = null; res.json({ ok: true });
+  await stopEverything();
+  res.json({ ok: true });
 }));
 
 /* Shuffle has to reorder on the speaker: the receiver's REPEAT_ALL_AND_SHUFFLE
