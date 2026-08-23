@@ -93,7 +93,11 @@ function remember(video_id, src_url, title, duration, content_id, session_id) {
 
 function recall({ content_id, session_id, title, duration }) {
   const recs = loadStore(), tok = cdnToken(content_id);
-  for (const [key, val] of [['content_id', content_id], ['cdn_token', tok], ['session_id', session_id]]) {
+  /* Deliberately NOT session_id: a Cast session outlives individual tracks, so
+     several videos share one, and matching on it returns whichever was stored
+     last rather than what is playing. content_id and cdn_token identify the
+     actual stream. */
+  for (const [key, val] of [['content_id', content_id], ['cdn_token', tok]]) {
     if (!val) continue;
     for (let i = recs.length - 1; i >= 0; i--) if (recs[i][key] === val) return { ...recs[i], matched_on: key };
   }
@@ -132,6 +136,7 @@ async function identify(title, duration) {
    pace, and a short window silently under-reports on a busy network. */
 const DEV = new Map();
 let bonjourInst = null, browserInst = null, settledOnce = false;
+S.discoveryError = null;
 
 function addService(svc) {
   const txt = svc.txt || {};
@@ -159,18 +164,28 @@ function deviceList() {
 
 function startDiscovery() {
   if (browserInst) return;
-  bonjourInst = new Bonjour();
-  browserInst = bonjourInst.find({ type: 'googlecast' }, addService);
-  browserInst.on && browserInst.on('up', addService);
-  setInterval(() => { try { browserInst.update(); } catch {} }, 20000);
-  console.log('[discovery] persistent mDNS browser started');
+  try {
+    bonjourInst = new Bonjour();
+    browserInst = bonjourInst.find({ type: 'googlecast' }, addService);
+    browserInst.on && browserInst.on('up', addService);
+    if (bonjourInst.on) bonjourInst.on('error', e => logErr('mdns: ' + e.message));
+    setInterval(() => { try { browserInst.update(); } catch {} }, 20000);
+    console.log('[discovery] persistent mDNS browser started');
+  } catch (e) {
+    browserInst = null; bonjourInst = null;
+    S.discoveryError = e.message;
+    logErr('discovery could not start: ' + e.message);
+    throw e;
+  }
 }
 
 /* Wait until the device set stops growing. If `want` is given, do not settle
    until that device has answered - devices reply at their own pace, and
    returning a partial list means the caller silently misses a speaker. */
 async function discover(ms = 9000, want = null) {
-  startDiscovery();
+  // must not throw: the caller needs to reach the "discovery is blocked" reply
+  try { startDiscovery(); } catch { /* recorded in S.discoveryError */ }
+  if (!browserInst) return deviceList();
   try { browserInst.update(); } catch {}
   const deadline = Date.now() + ms;
   const floor = Date.now() + 3500;
@@ -182,6 +197,42 @@ async function discover(ms = 9000, want = null) {
   }
   if (want && !DEV.has(want)) console.log(`[discovery] ${want} did not answer in ${ms}ms`);
   return deviceList();
+}
+
+/* Identity is keyed to the exact stream that is playing, and re-derived
+   whenever that changes. Keying it to the title was fragile, and keying it to
+   the Cast session was plainly wrong: one session spans many tracks. */
+S.identity = null;          // { contentId, video_id, confidence }
+let identifying = false;
+
+async function identifyLive(rm) {
+  if (!rm || !rm.contentId || identifying) return;
+  if (S.identity && S.identity.contentId === rm.contentId) return;
+  identifying = true;
+  const contentId = rm.contentId;
+  const title = (rm.metadata && rm.metadata.title) || null;
+  try {
+    const cd = rm.customData || {};
+    if (cd.video_id) {                                   // the item describes itself
+      S.identity = { contentId, video_id: cd.video_id, confidence: 'exact' };
+      return;
+    }
+    const hit = recall({ content_id: contentId, title, duration: rm.duration });
+    if (hit) {
+      S.identity = { contentId, video_id: hit.video_id, confidence: 'exact' };
+      S.srcUrl = hit.src_url;
+      console.log(`[identity] ${hit.video_id} via ${hit.matched_on}`);
+      return;
+    }
+    const guess = await identify(title, rm.duration);
+    S.identity = { contentId, video_id: guess ? guess.video_id : null,
+                   confidence: guess ? guess.confidence : 'none' };
+    if (guess) {
+      S.srcUrl = 'https://www.youtube.com/watch?v=' + guess.video_id;
+      console.log(`[identity] ${guess.video_id} by fingerprint (${guess.confidence})`);
+    } else console.log('[identity] could not identify what is playing');
+  } catch (e) { logErr('identify: ' + e.message); }
+  finally { identifying = false; }
 }
 
 /* ---------- cast plumbing ---------- */
@@ -528,6 +579,17 @@ app.get('/api/devices', async (req, res) => {
       await discover(req.query.refresh === '1' ? 15000 : 12000);
       settledOnce = true;
     }
+    if (S.discoveryError && !DEV.size) {
+      /* mDNS binds udp/5353 on 0.0.0.0, which is the one thing here that needs a
+         firewall allowance. Say so rather than returning a bare 500. */
+      return res.json({ devices: [], connected: S.device, settled: true,
+        active: null, active_count: 0,
+        error: 'Cannot search for speakers on this network.',
+        hint: 'Finding Cast devices needs UDP port 5353. Allow the app through '
+            + 'your firewall (Windows usually asks on first run), then press the '
+            + 'refresh button.',
+        detail: S.discoveryError });
+    }
     const devices = deviceList();
     /* Auto-attach only when exactly one audio-only speaker is busy - never to a
        video device, which would mean walking in on someone's film. */
@@ -535,7 +597,11 @@ app.get('/api/devices', async (req, res) => {
     res.json({ devices, connected: S.device, settled: settledOnce,
                active: active.length === 1 ? active[0].name : null,
                active_count: active.length });
-  } catch (e) { logErr(e); res.status(500).json({ error: String(e) }); }
+  } catch (e) {
+    logErr(e);
+    res.json({ devices: deviceList(), connected: S.device, settled: true,
+      active: null, active_count: 0, error: String(e.message || e) });
+  }
 });
 
 app.post('/api/attach', async (req, res) => {
@@ -561,18 +627,39 @@ app.get('/api/status', async (req, res) => {
     const state = st ? st.playerState : null;
     if (state === 'BUFFERING' && S.lastState === 'PLAYING') S.rebuffers++;
     S.lastState = state;
+
+    /* The receiver advances the queue on its own, so nothing here is told when
+       the track changes. Report what it is ACTUALLY playing - the item's own
+       customData carries its video id - rather than the last thing this process
+       loaded, which goes stale the moment the speaker moves on. */
+    const rm = st && st.media;
+    const cd = (rm && rm.customData) || {};
+    const liveTitle = cd.title || (rm && rm.metadata && rm.metadata.title) || null;
+    identifyLive(rm);            // no await: re-derives in the background on change
+    const ident = (S.identity && rm && S.identity.contentId === rm.contentId) ? S.identity : null;
+    const live = rm ? {
+      title: liveTitle,
+      duration: rm.duration ?? cd.duration ?? null,
+      video_id: cd.video_id || (ident && ident.video_id) || null,
+      identified: ident ? { confidence: ident.confidence } : undefined,
+      acodec: rm.contentType || null,
+      abr: (S.media && S.media.abr) || null,
+      ext: (S.media && S.media.ext) || null,
+    } : null;
+    const liveExpire = CQ.expiryOf(rm && rm.contentId);
+
     res.json({ connected: true, device: S.device, app: 'Default Media Receiver',
       state, position: (st && st.currentTime) || 0,
-      duration: (st && st.media && st.media.duration) || (S.media && S.media.duration) || null,
+      duration: (live && live.duration) || null,
       volume: vol == null ? null : +vol.toFixed(2), muted, rebuffers: S.rebuffers,
-      media: S.media, auto_refreshes: S.refreshes,
+      media: live, auto_refreshes: S.refreshes,
       queue: S.qcache ? { pos: S.qcache.pos, total: S.qcache.total,
         version: S.qcache.version, repeat: S.qcache.repeat,
         item: S.qcache.items[S.qcache.pos] || null,
         filling: S.fill ? { done: S.fill.done, total: S.fill.total } : null,
         can_next: S.qcache.total > 1 || S.qcache.repeat !== 'off',
         can_prev: S.qcache.total > 1 || S.qcache.repeat !== 'off' } : null,
-      expires_in: S.expire ? Math.round(S.expire - Date.now() / 1000) : null });
+      expires_in: liveExpire ? Math.round(liveExpire - Date.now() / 1000) : null });
   } catch (e) { res.json({ connected: true, error: String(e.message || e) }); }
 });
 
@@ -748,12 +835,19 @@ app.post('/api/queue/add', asyncRoute(async (req, res) => {
 app.get('/api/errors', (req, res) => res.json({ errors: S.errors.slice(-10) }));
 
 function start(port = process.env.PORT || 8765, host = process.env.HOST || '127.0.0.1') {
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     const srv = app.listen(port, host, () => {
       console.log(`\n  YouTube Audio Caster -> http://${host}:${port}\n`);
-      startDiscovery();
       resolve(srv);
+      /* Discovery starts AFTER resolve and cannot take the app down with it.
+         Binding mDNS on udp/5353 fails on plenty of Windows machines - Apple's
+         Bonjour service holds the port, or the firewall blocks it - and this
+         used to run before resolve(), so the promise never settled and the app
+         hung with no window and nothing logged. */
+      try { startDiscovery(); }
+      catch (e) { logErr('discovery unavailable: ' + e.message); }
     });
+    srv.on('error', e => reject(new Error(`cannot listen on ${host}:${port} - ${e.message}`)));
   });
 }
 module.exports = { start, app, S };

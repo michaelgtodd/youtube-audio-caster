@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, Notification } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, Notification, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
@@ -29,12 +29,32 @@ const freePort = () => new Promise(res => {
 
 /* The server starts ONCE for the app's lifetime - not per window. Opening a
    second window must not spin up a second listener on a new port. */
+/* Never wait forever: a startup step that hangs used to leave a running process
+   with no window and no way to tell what went wrong. */
+const withTimeout = (pr, ms, what) => Promise.race([pr,
+  new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} timed out after ${ms}ms`)), ms))]);
+
 async function ensureServer() {
   if (serverStarted) return PORT;
   PORT = await freePort();
-  await require('./server.js').start(PORT, '127.0.0.1');
+  await withTimeout(require('./server.js').start(PORT, '127.0.0.1'), 20000, 'server start');
   serverStarted = true;
   return PORT;
+}
+
+/* Startup problems have to be visible. Write them where a tester can find them
+   and show a dialog, rather than failing silently in an uncaught promise. */
+function startupFailed(err) {
+  const msg = (err && (err.stack || err.message)) || String(err);
+  try {
+    const f = path.join(app.getPath('userData'), 'startup-error.log');
+    fs.mkdirSync(app.getPath('userData'), { recursive: true });
+    fs.writeFileSync(f, `${new Date().toISOString()}\n${process.platform} ${process.arch}\n\n${msg}\n`);
+    console.error('[startup] failed:', msg);
+    dialog.showErrorBox('YouTube Audio Caster could not start',
+      `${msg}\n\nDetails were written to:\n${f}`);
+  } catch (e) { console.error('[startup] failed:', msg, '(and could not report it:', e.message + ')'); }
+  app.exit(1);
 }
 
 async function showWindow() {
@@ -165,10 +185,14 @@ app.whenReady().then(async () => {
   if (isMac && app.dock) app.dock.hide();
   if (isWin) app.setAppUserModelId('com.michaelgtodd.youtube-audio-caster');
   await ensureServer();
-  buildTray();
+  try { buildTray(); }
+  catch (e) { console.error('[tray] unavailable:', e.message); }   // not fatal
   await showWindow();
   app.on('activate', () => showWindow());
-});
+}).catch(startupFailed);
+
+process.on('uncaughtException', startupFailed);
+process.on('unhandledRejection', startupFailed);
 
 app.on('before-quit', () => { app.isQuitting = true; });
 // closing the window must NOT quit - the watchdog keeps CDN urls alive

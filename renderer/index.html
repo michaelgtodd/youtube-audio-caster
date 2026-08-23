@@ -365,7 +365,12 @@ async function loadDevices(refresh){
   $('device').innerHTML='<option>scanning…</option>';
   try{
     const j=await api('/api/devices'+(refresh?'?refresh=1':''));
-    $('device').innerHTML = deviceOptions(j.devices) || '<option value="">none found</option>';
+    $('device').innerHTML = deviceOptions(j.devices) || '<option value="">no speakers found</option>';
+    if(j.error){
+      msg(`<b>${esc(j.error)}</b><br>${esc(j.hint||'')}`,'err');
+      $('noplayer').textContent='No speakers found yet.';
+      return;
+    }
     /* Attach to whatever is actually playing rather than to a remembered choice.
        mDNS reports which speakers are busy, so this needs nothing stored. */
     const pick = j.connected || j.active;
