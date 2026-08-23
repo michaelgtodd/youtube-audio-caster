@@ -100,12 +100,17 @@ jobs:
           sleep 2
           npx electron-builder --dir --publish never 2>&1 | tail -3
           if [ "$RUNNER_OS" = "Windows" ]; then
-            BIN=$(find dist -name '*.exe' -path '*unpacked*' | head -1)
+            # only the top level of win-unpacked: deeper matches hit the bundled
+            # yt-dlp.exe, which starts happily and proves nothing
+            BIN=$(find dist/win-unpacked -maxdepth 1 -name '*.exe' | head -1)
           else
             BIN=$(find dist -path '*.app/Contents/MacOS/*' -type f -perm -u+x | head -1)
           fi
           echo "packaged binary: $BIN"
           [ -n "$BIN" ] || { echo "NO PACKAGED BINARY FOUND"; ls -R dist | head -30; exit 1; }
+          case "$BIN" in
+            *yt-dlp*|*resources*) echo "picked the wrong binary: $BIN"; exit 1 ;;
+          esac
           "$BIN" > packaged.log 2>&1 &
           for i in $(seq 1 45); do
             PORT=$(grep -oE '127\.0\.0\.1:[0-9]+' packaged.log 2>/dev/null | head -1 | cut -d: -f2 || true)
