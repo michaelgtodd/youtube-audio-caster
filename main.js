@@ -7,6 +7,26 @@ const net = require('net');
 const isMac = process.platform === 'darwin';
 const isWin = process.platform === 'win32';
 
+/* Registered first, before anything can throw. A failure during module load or
+   in the single-instance check used to be completely uncaught, which is exactly
+   how the app ended up running with no window and nothing to show for it. */
+function startupFailed(err) {
+  const msg = (err && (err.stack || err.message)) || String(err);
+  console.error('[startup] failed:', msg);
+  try {
+    const dir = app.getPath('userData');
+    fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, 'startup-error.log');
+    fs.writeFileSync(f, `${new Date().toISOString()}\n${process.platform} ${process.arch} `
+      + `electron ${process.versions.electron}\n\n${msg}\n`);
+    dialog.showErrorBox('YouTube Audio Caster could not start',
+      `${msg}\n\nDetails were written to:\n${f}`);
+  } catch (e) { console.error('[startup] could not report it:', e.message); }
+  app.exit(1);
+}
+process.on('uncaughtException', startupFailed);
+process.on('unhandledRejection', startupFailed);
+
 /* Two instances would race for the same speaker and start two servers. */
 if (!app.requestSingleInstanceLock()) { app.quit(); return; }
 
@@ -40,21 +60,6 @@ async function ensureServer() {
   await withTimeout(require('./server.js').start(PORT, '127.0.0.1'), 20000, 'server start');
   serverStarted = true;
   return PORT;
-}
-
-/* Startup problems have to be visible. Write them where a tester can find them
-   and show a dialog, rather than failing silently in an uncaught promise. */
-function startupFailed(err) {
-  const msg = (err && (err.stack || err.message)) || String(err);
-  try {
-    const f = path.join(app.getPath('userData'), 'startup-error.log');
-    fs.mkdirSync(app.getPath('userData'), { recursive: true });
-    fs.writeFileSync(f, `${new Date().toISOString()}\n${process.platform} ${process.arch}\n\n${msg}\n`);
-    console.error('[startup] failed:', msg);
-    dialog.showErrorBox('YouTube Audio Caster could not start',
-      `${msg}\n\nDetails were written to:\n${f}`);
-  } catch (e) { console.error('[startup] failed:', msg, '(and could not report it:', e.message + ')'); }
-  app.exit(1);
 }
 
 async function showWindow() {
@@ -191,8 +196,6 @@ app.whenReady().then(async () => {
   app.on('activate', () => showWindow());
 }).catch(startupFailed);
 
-process.on('uncaughtException', startupFailed);
-process.on('unhandledRejection', startupFailed);
 
 app.on('before-quit', () => { app.isQuitting = true; });
 // closing the window must NOT quit - the watchdog keeps CDN urls alive
