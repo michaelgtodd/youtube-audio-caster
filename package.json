@@ -1,10 +1,10 @@
 {
   "name": "youtube-audio-caster",
-  "version": "1.1.1",
+  "version": "1.2.0-beta.5",
   "description": "Cast a YouTube video's audio to an audio-only Google speaker as a native buffered stream instead of fragile screen mirroring",
   "main": "main.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test test/*.test.js",
     "start": "electron .",
     "server": "node server.js",
     "postinstall": "node scripts/fetch-ytdlp.js && node scripts/make-icon.js",
@@ -35,13 +35,20 @@
       "output": "dist"
     },
     "files": [
-      "main.js",
-      "server.js",
-      "playlists.js",
-      "renderer/**",
-      "assets/**",
-      "node_modules/**",
-      "package.json"
+      "**/*",
+      "!dist/**",
+      "!test/**",
+      "!docs/**",
+      "!.github/**",
+      "!scripts/**",
+      "!*.log",
+      "!sessions.json",
+      "!playlists.json",
+      "!settings.json",
+      "!ui-flags.json",
+      "!startup-error.log",
+      "!.gitattributes",
+      "!.gitignore"
     ],
     "extraResources": [
       {
@@ -69,7 +76,8 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "shortcutName": "YouTube Audio Caster"
+      "shortcutName": "YouTube Audio Caster",
+      "artifactName": "${productName}-${version}-Windows-Installer.${ext}"
     },
     "mac": {
       "target": [
@@ -90,6 +98,12 @@
       ],
       "icon": "assets/icon.png",
       "category": "public.app-category.music"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Windows-Portable-NoInstall.${ext}"
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-macOS-${arch}.${ext}"
     }
   }
 }

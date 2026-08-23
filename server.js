@@ -1,4 +1,5 @@
 'use strict';
+
 /* CastAudio server - Node port of server.py.
    Sends a video's AUDIO ONLY to an audio-only Cast speaker as a native buffered
    stream. Runs inside Electron, or headless on any box that can reach the LAN. */
@@ -9,11 +10,14 @@ const { execFile } = require('child_process');
 const { Client, DefaultMediaReceiver } = require('castv2-client');
 const { Bonjour } = require('bonjour-service');
 const PL = require('./playlists.js');
+const CQ = require('./castqueue.js');
+const ID = require('./identity.js');
+const { videoIdOf, isPlaylistUrl, cdnToken, expiryOf, remember, recall } = ID;
 
 const DMR_APP_ID = 'CC1AD845';
 const YTDLP = process.env.YTDLP || path.join(__dirname, 'bin', 'yt-dlp');
 const DATA_DIR = process.env.CASTAUDIO_DATA || __dirname;
-const SESSIONS = path.join(DATA_DIR, 'sessions.json');
+ID.setStorePath(path.join(DATA_DIR, 'sessions.json'));
 const SETTINGS = path.join(DATA_DIR, 'settings.json');
 PL.init(DATA_DIR);
 const loadSettings = () => { try { return JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); } catch { return {}; } };
@@ -48,10 +52,6 @@ async function extract(pageUrl) {
     thumb: info.thumbnail || null, video_id: info.id };
 }
 
-const VID_RE = [/[?&]v=([A-Za-z0-9_-]{11})/, /youtu\.be\/([A-Za-z0-9_-]{11})/,
-                /\/shorts\/([A-Za-z0-9_-]{11})/, /\/embed\/([A-Za-z0-9_-]{11})/];
-const videoIdOf = u => { for (const r of VID_RE) { const m = String(u).match(r); if (m) return m[1]; } return null; };
-const isPlaylistUrl = u => /\/playlist\b/.test(u) || (/[?&]list=/.test(u) && !videoIdOf(u));
 
 /* oEmbed is one HTTP request and returns in ~0.1s. yt-dlp needs ~8s for the same
    video because it makes several sequential calls to YouTube's player APIs. Use
@@ -75,34 +75,8 @@ async function resolveItems(pageUrl) {
 }
 
 /* ---------- session store: exact recall beats inference ---------- */
-const loadStore = () => { try { return JSON.parse(fs.readFileSync(SESSIONS, 'utf8')); } catch { return []; } };
-const saveStore = r => { try { fs.writeFileSync(SESSIONS + '.tmp', JSON.stringify(r.slice(-200), null, 1));
-  fs.renameSync(SESSIONS + '.tmp', SESSIONS); } catch (e) { logErr('store save: ' + e); } };
-const cdnToken = u => (String(u || '').match(/[?&]id=([^&]+)/) || [])[1] || null;
-const expiryOf = u => { const m = String(u || '').match(/[?&]expire=(\d+)/); return m ? +m[1] : null; };
 
-function remember(video_id, src_url, title, duration, content_id, session_id) {
-  if (!video_id) return;
-  let recs = loadStore().filter(r => r.video_id !== video_id);
-  recs.push({ ts: Date.now() / 1000, video_id, src_url, title, duration, session_id,
-    content_id, cdn_token: cdnToken(content_id) });
-  saveStore(recs);
-  console.log(`[store] remembered ${video_id}`);
-}
 
-function recall({ content_id, session_id, title, duration }) {
-  const recs = loadStore(), tok = cdnToken(content_id);
-  for (const [key, val] of [['content_id', content_id], ['cdn_token', tok], ['session_id', session_id]]) {
-    if (!val) continue;
-    for (let i = recs.length - 1; i >= 0; i--) if (recs[i][key] === val) return { ...recs[i], matched_on: key };
-  }
-  if (title) for (let i = recs.length - 1; i >= 0; i--) {
-    const r = recs[i];
-    if (r.title === title && (!duration || !r.duration || Math.abs(r.duration - duration) < 2))
-      return { ...r, matched_on: 'title+duration' };
-  }
-  return null;
-}
 
 /* fallback: fingerprint on title + exact duration (CDN url has only an opaque token) */
 async function identify(title, duration) {
@@ -130,7 +104,8 @@ async function identify(title, duration) {
 /* A persistent browser beats one-shot queries: Cast devices answer at their own
    pace, and a short window silently under-reports on a busy network. */
 const DEV = new Map();
-let bonjourInst = null, browserInst = null;
+let settledOnce = false;
+S.discoveryError = null;
 
 function addService(svc) {
   const txt = svc.txt || {};
@@ -139,10 +114,15 @@ function addService(svc) {
   if (!name || !host) return;
   const ca = parseInt(txt.ca || '0', 10);
   const port = svc.port || 8009;
+  /* st=1 means the device has something loaded and rs is what it is, both
+     straight from mDNS - so "which speaker is playing" needs no connection and
+     no remembered preference. */
   DEV.set(name, { name, model: txt.md || '?', host, port,
-    audio_only: !(ca & 1),
+    audio_only: !(ca & 1),                    // ca bit 0 = VIDEO_OUT
     is_group: /group/i.test(txt.md || '') || port !== 8009,
-    seen: Date.now() });   // ca bit 0 = VIDEO_OUT
+    busy: String(txt.st || '0') === '1',
+    status_text: txt.rs || '',
+    seen: Date.now() });
 }
 
 function deviceList() {
@@ -151,21 +131,64 @@ function deviceList() {
   return S.devices;
 }
 
+/* Browse on EVERY external IPv4 interface, not whichever one the library picks.
+   Windows machines routinely carry Hyper-V, WSL, VirtualBox and VPN adapters,
+   and binding mDNS to one of those finds nothing at all while looking perfectly
+   healthy. Macs hit the same thing with VPN tunnels. */
+const os = require('os');
+const externalIPv4 = () => Object.entries(os.networkInterfaces()).flatMap(
+  ([name, addrs]) => (addrs || [])
+    .filter(a => a.family === 'IPv4' && !a.internal)
+    .map(a => ({ name, address: a.address })));
+
+let browsers = [];            // one per interface
+S.discovery = { started: false, interfaces: [], error: null };
+
 function startDiscovery() {
-  if (browserInst) return;
-  bonjourInst = new Bonjour();
-  browserInst = bonjourInst.find({ type: 'googlecast' }, addService);
-  browserInst.on && browserInst.on('up', addService);
-  setInterval(() => { try { browserInst.update(); } catch {} }, 20000);
-  console.log('[discovery] persistent mDNS browser started');
+  if (browsers.length) return;
+  const ifaces = externalIPv4();
+  S.discovery.interfaces = [];
+
+  const spin = (label, opts) => {
+    try {
+      const b = new Bonjour(opts);
+      const br = b.find({ type: 'googlecast' }, addService);
+      if (br.on) br.on('up', addService);
+      browsers.push({ label, bonjour: b, browser: br });
+      S.discovery.interfaces.push({ label, ok: true });
+      return true;
+    } catch (e) {
+      S.discovery.interfaces.push({ label, ok: false, error: e.message });
+      logErr(`mdns on ${label}: ${e.message}`);
+      return false;
+    }
+  };
+
+  /* The default browser is the one that actually works - binding to a specific
+     interface found nothing at all on macOS. Start it first and always keep it;
+     the per-interface browsers are an ADDITION for machines where the default
+     picks a virtual adapter (Hyper-V, WSL, VPN) and sees nothing. */
+  spin('default', undefined);
+  for (const i of ifaces) spin(`${i.name} ${i.address}`, { interface: i.address });
+  if (!browsers.length) {
+    S.discovery.error = 'could not open mDNS on any interface';
+    S.discoveryError = S.discovery.error;
+    throw new Error(S.discovery.error);
+  }
+  S.discovery.started = true;
+  setInterval(() => { for (const b of browsers) { try { b.browser.update(); } catch {} } }, 20000).unref();
+  console.log(`[discovery] browsing on ${browsers.length} interface(s): `
+    + browsers.map(b => b.label).join(', '));
 }
 
 /* Wait until the device set stops growing. If `want` is given, do not settle
    until that device has answered - devices reply at their own pace, and
    returning a partial list means the caller silently misses a speaker. */
 async function discover(ms = 9000, want = null) {
-  startDiscovery();
-  try { browserInst.update(); } catch {}
+  // must not throw: the caller needs to reach the "discovery is blocked" reply
+  try { startDiscovery(); } catch { /* recorded in S.discovery.error */ }
+  if (!browsers.length) return deviceList();
+  for (const b of browsers) { try { b.browser.update(); } catch {} }
   const deadline = Date.now() + ms;
   const floor = Date.now() + 3500;
   let last = -1, stable = 0;
@@ -176,6 +199,42 @@ async function discover(ms = 9000, want = null) {
   }
   if (want && !DEV.has(want)) console.log(`[discovery] ${want} did not answer in ${ms}ms`);
   return deviceList();
+}
+
+/* Identity is keyed to the exact stream that is playing, and re-derived
+   whenever that changes. Keying it to the title was fragile, and keying it to
+   the Cast session was plainly wrong: one session spans many tracks. */
+S.identity = null;          // { contentId, video_id, confidence }
+let identifying = false;
+
+async function identifyLive(rm) {
+  if (!rm || !rm.contentId || identifying) return;
+  if (S.identity && S.identity.contentId === rm.contentId) return;
+  identifying = true;
+  const contentId = rm.contentId;
+  const title = (rm.metadata && rm.metadata.title) || null;
+  try {
+    const cd = rm.customData || {};
+    if (cd.video_id) {                                   // the item describes itself
+      S.identity = { contentId, video_id: cd.video_id, confidence: 'exact' };
+      return;
+    }
+    const hit = recall({ content_id: contentId, title, duration: rm.duration });
+    if (hit) {
+      S.identity = { contentId, video_id: hit.video_id, confidence: 'exact' };
+      S.srcUrl = hit.src_url;
+      console.log(`[identity] ${hit.video_id} via ${hit.matched_on}`);
+      return;
+    }
+    const guess = await identify(title, rm.duration);
+    S.identity = { contentId, video_id: guess ? guess.video_id : null,
+                   confidence: guess ? guess.confidence : 'none' };
+    if (guess) {
+      S.srcUrl = 'https://www.youtube.com/watch?v=' + guess.video_id;
+      console.log(`[identity] ${guess.video_id} by fingerprint (${guess.confidence})`);
+    } else console.log('[identity] could not identify what is playing');
+  } catch (e) { logErr('identify: ' + e.message); }
+  finally { identifying = false; }
 }
 
 /* ---------- cast plumbing ---------- */
@@ -208,7 +267,6 @@ async function connectDevice(name) {
   catch (e) { console.log(`[connect] FAILED ${dev.host}:${dev.port}: ${e && e.message}`); throw e; }
   console.log(`[connect] tls up to ${dev.host}:${dev.port}${dev.is_group ? ' (group)' : ''}`);
   S.client = client; S.device = name; S.host = dev.host;
-  saveSettings({ ...loadSettings(), lastDevice: name });
   return { client, dev };
 }
 
@@ -232,7 +290,7 @@ async function attach(name) {
     return { adopted: false, app: sessions[0]?.displayName || null };
   }
   console.log(`[attach] joined session ${live.sessionId.slice(0, 8)}`);
-  const player = wirePlayer(await p(client, 'join', live, DefaultMediaReceiver));
+  const player = await p(client, 'join', live, DefaultMediaReceiver);
   S.player = player;
   // The first getStatus after join routinely comes back before the receiver has
   // populated .media - poll briefly rather than concluding nothing is playing.
@@ -291,7 +349,7 @@ async function castUrl(pageUrl, name) {
       await new Promise(r => setTimeout(r, 3000));
     }
   }
-  const player = wirePlayer(await p(client, 'launch', DefaultMediaReceiver));
+  const player = await p(client, 'launch', DefaultMediaReceiver);
   S.player = player;
   await p(player, 'load', {
     contentId: m.url, contentType: m.ctype, streamType: 'BUFFERED',
@@ -335,25 +393,20 @@ function pumpJobs() {
 async function runJob(job) {
   const vid = videoIdOf(job.url);
   if (vid && !isPlaylistUrl(job.url)) {
-    // fast path: show it now, get the duration later
     let title = vid, thumb = `https://i.ytimg.com/vi/${vid}/mqdefault.jpg`;
     try { const o = await oembed(vid); title = o.title || vid; } catch (e) { logErr('oembed: ' + e.message); }
-    const item = { video_id: vid, title, duration: null,
-                   url: 'https://www.youtube.com/watch?v=' + vid, thumb };
-    if (!PL.addItems(job.playlistId, [item])) throw new Error('no such playlist');
+    const it = { video_id: vid, title, duration: null,
+                 url: 'https://www.youtube.com/watch?v=' + vid, thumb };
+    if (!PL.addItems(job.playlistId, [it])) throw new Error('no such playlist');
     job.added = 1; job.state = 'done'; job.msg = title;
     console.log(`[add] ${title.slice(0, 44)} (duration pending)`);
-    try {                                   // backfill duration without blocking anything
+    try {
       const info = JSON.parse(await ytdlp(['-4', '--no-warnings', '--no-playlist', '-J',
-        '--flat-playlist', item.url]));
-      if (info && info.duration) {
-        PL.updateItem(job.playlistId, vid, { duration: info.duration });
-        console.log(`[add] duration ${info.duration}s for ${title.slice(0, 30)}`);
-      }
+        '--flat-playlist', it.url]));
+      if (info && info.duration) PL.updateItem(job.playlistId, vid, { duration: info.duration });
     } catch (e) { logErr('duration backfill: ' + e.message); }
     return;
   }
-  // playlist url: one yt-dlp call covers every entry, durations included
   const items = await resolveItems(job.url);
   if (!items.length) throw new Error('nothing found at that url');
   if (!PL.addItems(job.playlistId, items)) throw new Error('no such playlist');
@@ -361,145 +414,116 @@ async function runJob(job) {
   console.log(`[add] +${items.length} items`);
 }
 
-/* ---------- playlist queue ---------- */
-const shuffled = n => { const a = [...Array(n).keys()];
-  for (let i = n - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
-  return a; };
+/* ---------- the queue, which lives on the speaker ----------
+   This process no longer advances tracks, prefetches, or watches for the end of
+   one. The receiver does all three by itself, and keeps doing them with nothing
+   connected. What is left here is: put items on the speaker, and rewrite their
+   urls before they expire. */
 
-/* The queue holds its own copy of the items rather than pointing at a playlist.
-   That lets you append arbitrary videos to what is playing without touching -
-   or even having - a saved playlist. */
-const queueItems = () => (S.queue ? S.queue.items : []);
+S.fill = null;                    // progress of the background queue fill
 
-function ensureQueue() {
-  if (S.queue) return S.queue;
-  const items = [];
-  if (S.media && S.media.video_id) {      // seed from whatever is already playing
-    items.push({ video_id: S.media.video_id, title: S.media.title,
-      duration: S.media.duration, url: 'https://www.youtube.com/watch?v=' + S.media.video_id,
-      thumb: `https://i.ytimg.com/vi/${S.media.video_id}/mqdefault.jpg` });
+const asCastItem = async entry => CQ.item(await extract(entry.url), entry);
+
+/* Push items in batches: one Cast message caps at 64KB (50 items load, 60 kills
+   the connection), so 25 at a time with room to spare. */
+async function insertBatched(items) {
+  for (let i = 0; i < items.length; i += CQ.BATCH) {
+    await p(S.player, 'queueInsert', items.slice(i, i + CQ.BATCH), {});
+    await new Promise(r => setTimeout(r, 400));
   }
-  S.queue = { playlistId: null, name: 'Queue', items, order: items.map((_, i) => i),
-              pos: 0, repeat: 'off', shuffle: false, version: 1 };
-  return S.queue;
 }
 
-function queueAppend(newItems) {
-  const q = ensureQueue();
-  const have = new Set(q.items.map(i => i.video_id));
-  const fresh = newItems.filter(i => i.video_id && !have.has(i.video_id));
-  const base = q.items.length;
-  q.items.push(...fresh);
-  fresh.forEach((_, i) => q.order.push(base + i));
-  q.version++;
-  console.log(`[queue] +${fresh.length} queued (${q.order.length} total)`);
-  return { added: fresh.length, queue: q };
-}
-
-function nextPos(dir) {
-  const q = S.queue; if (!q) return -1;
-  const n = q.order.length; if (!n) return -1;
-  if (dir > 0 && q.repeat === 'one') return q.pos;
-  const t = q.pos + dir;
-  if (t >= 0 && t < n) return t;
-  if (q.repeat === 'all') return t < 0 ? n - 1 : 0;
-  return -1;
-}
-
-/* Extraction takes several seconds, and doing it at the moment a track ends
-   leaves an audible gap. Resolve the next track's stream while the current one
-   is still playing so advancing is just a load(). */
-S.prefetch = null;
-async function prefetchNext() {
-  if (!S.queue) return;
-  const np = nextPos(1);
-  if (np < 0) { S.prefetch = null; return; }
-  const it = queueItems()[S.queue.order[np]];
-  if (!it) return;
-  if (S.prefetch && S.prefetch.video_id === it.video_id) return;
+/* Extraction costs ~8s a video, so a long playlist cannot be resolved up front.
+   Load a few, start playing, then fill the rest in the background - once the
+   fill completes the speaker holds the whole queue and needs nothing from us. */
+/* queueInsert needs a live media session - there is no mediaSessionId until
+   something has been loaded - so adding to an idle speaker has to start the
+   queue rather than append to it. */
+/* Ask the receiver whether a media session is actually live. The cache can be
+   stale - a queue that finished ends the session, and queueInsert then fails
+   with INVALID_MEDIA_SESSION_ID - and getStatus also refreshes the controller's
+   own mediaSessionId, which insert depends on. */
+async function queueIsLive() {
+  if (!S.player) return false;
   try {
-    const m = await extract(it.url);
-    S.prefetch = { video_id: it.video_id, pageUrl: it.url, m, at: Date.now() };
-    console.log(`[queue] prefetched next: ${it.title.slice(0, 40)}`);
-  } catch (e) { logErr('prefetch: ' + e.message); S.prefetch = null; }
+    const st = await p(S.player, 'getStatus');
+    return !!(st && st.mediaSessionId && st.playerState && st.playerState !== 'IDLE');
+  } catch { return false; }
 }
 
-async function applyMedia(m, pageUrl) {
-  await p(S.player, 'load', {
-    contentId: m.url, contentType: m.ctype, streamType: 'BUFFERED',
-    metadata: { type: 0, metadataType: 3, title: m.title, images: m.thumb ? [{ url: m.thumb }] : [] },
-  }, { autoplay: true });
-  S.media = { title: m.title, duration: m.duration, abr: m.abr, acodec: m.acodec,
-    ext: m.ext, video_id: m.video_id };
-  S.srcUrl = pageUrl; S.rebuffers = 0; S.lastState = null;
-  S.expire = expiryOf(m.url); S.cdnUrl = m.url;
-  let sid = null; try { sid = ((await p(S.client, 'getSessions')) || [])[0]?.sessionId; } catch {}
-  remember(m.video_id, pageUrl, m.title, m.duration, m.url, sid);
-  return S.media;
-}
-
-async function playQueuePos(pos, token) {
-  const items = queueItems();
-  const it = items[S.queue.order[pos]];
-  if (!it) return false;
-  S.queue.pos = pos;
-  console.log(`[queue] ${pos + 1}/${S.queue.order.length}  ${it.title.slice(0, 45)}`);
-  try {
-    const pre = S.prefetch && S.prefetch.video_id === it.video_id ? S.prefetch : null;
-    S.prefetch = null;
-    // a newer skip may have landed while this one was resolving
-    if (token && token !== advanceToken) { console.log('[queue] superseded'); return false; }
-    if (S.player && pre) { console.log('[queue] using prefetched stream'); await applyMedia(pre.m, pre.pageUrl); }
-    else if (S.player) await loadMedia(it.url);
-    else await castUrl(it.url, S.device);
-    prefetchNext().catch(() => {});          // get the following one ready
-    return true;
-  } catch (e) { logErr(`queue play: ${e.message}`); return false; }
-}
-
-async function startQueue(playlistId, startIndex = 0, opts = {}) {
-  const pl = PL.get(playlistId);
-  if (!pl || !pl.items.length) throw new Error('playlist is empty');
-  const shuffle = !!opts.shuffle;
-  let order = shuffle ? shuffled(pl.items.length) : [...Array(pl.items.length).keys()];
-  if (shuffle) {                       // start on the track that was asked for
-    order = [startIndex, ...order.filter(i => i !== startIndex)];
+async function ensurePlayer() {
+  if (S.player) return S.player;
+  if (!S.client) throw new Error('no device connected');
+  const sessions = await p(S.client, 'getSessions').catch(() => []);
+  for (const sess of sessions || []) {
+    if (sess.appId !== DMR_APP_ID) { try { await p(S.client, 'stop', sess); } catch {} }
   }
-  S.queue = { playlistId, name: pl.name, items: pl.items.map(i => ({ ...i })), order,
-              pos: shuffle ? 0 : startIndex, repeat: opts.repeat || 'off', shuffle, version: 1 };
-  if (!S.client || !S.device) throw new Error('no device connected');
-  await playQueuePos(S.queue.pos);
-  return S.queue;
+  console.log('[queue] launching the media receiver to hold a queue');
+  S.player = await p(S.client, 'launch', DefaultMediaReceiver);
+  return S.player;
 }
 
-let advanceToken = 0;
-async function advance(dir) {
-  if (!S.queue) return false;
-  const np = nextPos(dir);
-  if (np < 0) { console.log('[queue] end of playlist'); S.queue = null; return false; }
-  return playQueuePos(np, ++advanceToken);
-}
+async function loadQueue(entries, startIndex, opts) {
+  await ensurePlayer();
+  const ordered = entries.slice(startIndex).concat(entries.slice(0, startIndex));
+  const head = [];
+  for (const e of ordered.slice(0, CQ.HEAD)) head.push(await asCastItem(e));
+  await p(S.player, 'queueLoad', head, { startIndex: 0,
+    repeatMode: CQ.REPEAT[opts.repeat || 'off'] });
+  console.log(`[queue] loaded ${head.length}, filling ${ordered.length - head.length} more`);
+  head.forEach(h => remember(h.customData.video_id, h.customData.page,
+    h.customData.title, h.customData.duration, h.media.contentId, null));
 
-/* End-of-track detection is event driven. Polling getStatus() does not work:
-   once a track finishes the receiver stops returning a media status at all, so
-   there is no IDLE/FINISHED to observe - the call just yields null. The player
-   does push a status message carrying idleReason, so listen for that. */
-let lastAdvance = 0;
-function wirePlayer(player) {
-  if (!player || player.__wired) return player;
-  player.__wired = true;
-  player.on('status', st => {
-    if (!st) return;
-    if (st.playerState) S.lastState = st.playerState;
-    if (st.playerState === 'IDLE' && st.idleReason === 'FINISHED') {
-      if (Date.now() - lastAdvance < 6000) return;
-      lastAdvance = Date.now();
-      console.log('[queue] track finished');
-      if (S.queue) advance(1).catch(e => logErr('advance: ' + e.message));
+  const rest = ordered.slice(CQ.HEAD);
+  S.fill = { done: 0, total: rest.length };
+  (async () => {
+    const buf = [];
+    for (const e of rest) {
+      try { buf.push(await asCastItem(e)); } catch (err) { logErr('fill: ' + err.message); }
+      S.fill.done++;
+      if (buf.length >= CQ.BATCH) { await insertBatched(buf.splice(0)); }
     }
-  });
-  return player;
+    if (buf.length) await insertBatched(buf);
+    console.log(`[queue] fill complete (${S.fill.total} queued behind the head)`);
+    S.fill = null;
+  })().catch(e => { logErr('fill: ' + e.message); S.fill = null; });
 }
+
+/* Read the live queue off the speaker. getStatus only returns a 2-item window,
+   so the full list comes from QUEUE_GET_ITEM_IDS + QUEUE_GET_ITEMS. */
+async function speakerQueue() {
+  if (!S.player) return null;
+  try {
+    const q = await CQ.readQueue(S.player);
+    if (!q || q.itemIds.length < 1) return null;
+    const items = q.items.map(CQ.describe);
+    const pos = Math.max(0, q.itemIds.indexOf(q.status.currentItemId));
+    return { items, itemIds: q.itemIds, pos, total: q.itemIds.length,
+             repeat: Object.keys(CQ.REPEAT).find(k => CQ.REPEAT[k] === q.status.repeatMode) || 'off',
+             currentItemId: q.status.currentItemId };
+  } catch (e) { return null; }
+}
+
+/* Rewrite urls that are close to expiry. Conditional on what is actually on the
+   speaker, so two clients doing this converge instead of fighting: whoever gets
+   there first makes the item fresh, and the other sees fresh and does nothing. */
+async function refreshExpiring() {
+  const q = await speakerQueue();
+  if (!q) return;
+  const now = Date.now() / 1000;
+  const stale = q.items.filter(i => i.expires && i.expires - now < CQ.REFRESH_BELOW && i.url);
+  if (!stale.length) return;
+  console.log(`[queue] refreshing ${stale.length} url(s) nearing expiry`);
+  for (const it of stale.slice(0, CQ.BATCH)) {
+    try {
+      const m = await extract(it.url);
+      const fresh = CQ.item(m, { video_id: it.video_id, url: it.url, duration: it.duration });
+      await p(S.player, 'queueUpdate', [{ itemId: it.itemId, media: fresh.media,
+        customData: fresh.customData }], {});
+    } catch (e) { logErr('refresh ' + it.video_id + ': ' + e.message); }
+  }
+}
+setInterval(() => { refreshExpiring().catch(() => {}); }, 15 * 60 * 1000).unref();
 
 /* ---------- watchdog: re-issue the CDN url before it expires ---------- */
 async function reissue(reason) {
@@ -518,6 +542,9 @@ async function reissue(reason) {
 setInterval(async () => {
   try {
     if (!S.player || !S.srcUrl) return;
+    // A queue is refreshed in place by refreshExpiring(); reissue() replaces the
+    // whole media session and would wipe it.
+    if (S.qcache) return;
     if (Date.now() - S.lastRefresh < 60000) return;
     if (S.expire && Date.now() / 1000 > S.expire - 300)
       return void reissue(`cdn url expires in ${Math.round(S.expire - Date.now() / 1000)}s`);
@@ -527,6 +554,20 @@ setInterval(async () => {
   } catch (e) { /* transient */ }
 }, 15000);
 
+/* A cached view of the speaker's queue. Reading it costs several round trips,
+   so it is refreshed on a timer and after any command, not on every poll. */
+S.qcache = null;
+let qver = 0;
+async function syncQueue() {
+  const q = await speakerQueue();
+  if (!q) { S.qcache = null; return null; }
+  const sig = q.itemIds.join(',') + '|' + q.currentItemId + '|' + q.repeat;
+  if (!S.qcache || S.qcache.sig !== sig) { qver++; }
+  S.qcache = { ...q, sig, version: qver };
+  return S.qcache;
+}
+setInterval(() => { if (S.player) syncQueue().catch(() => {}); }, 4000).unref();
+
 /* ---------- api ---------- */
 const app = express();
 app.use(express.json());
@@ -534,11 +575,35 @@ app.use(express.static(path.join(__dirname, 'renderer')));
 
 app.get('/api/devices', async (req, res) => {
   try {
-    const want = loadSettings().lastDevice || null;
-    if (req.query.refresh === '1') await discover(15000, want);
-    else if (!DEV.size || (want && !DEV.has(want))) await discover(12000, want);
-    res.json({ devices: deviceList(), connected: S.device, preferred: want });
-  } catch (e) { logErr(e); res.status(500).json({ error: String(e) }); }
+    /* The first answer has to be a settled list. Devices reply to mDNS at their
+       own pace, and returning early is how the picker ends up short. */
+    if (req.query.refresh === '1' || !settledOnce) {
+      await discover(req.query.refresh === '1' ? 15000 : 12000);
+      settledOnce = true;
+    }
+    if (S.discoveryError && !DEV.size) {
+      /* mDNS binds udp/5353 on 0.0.0.0, which is the one thing here that needs a
+         firewall allowance. Say so rather than returning a bare 500. */
+      return res.json({ devices: [], connected: S.device, settled: true,
+        active: null, active_count: 0,
+        error: 'Cannot search for speakers on this network.',
+        hint: 'Finding Cast devices needs UDP port 5353. Allow the app through '
+            + 'your firewall (Windows usually asks on first run), then press the '
+            + 'refresh button.',
+        detail: S.discoveryError });
+    }
+    const devices = deviceList();
+    /* Auto-attach only when exactly one audio-only speaker is busy - never to a
+       video device, which would mean walking in on someone's film. */
+    const active = devices.filter(d => d.busy && d.audio_only);
+    res.json({ devices, connected: S.device, settled: settledOnce,
+               active: active.length === 1 ? active[0].name : null,
+               active_count: active.length });
+  } catch (e) {
+    logErr(e);
+    res.json({ devices: deviceList(), connected: S.device, settled: true,
+      active: null, active_count: 0, error: String(e.message || e) });
+  }
 });
 
 app.post('/api/attach', async (req, res) => {
@@ -558,32 +623,45 @@ app.get('/api/status', async (req, res) => {
   if (!S.player) return res.json({ connected: false });
   try {
     const st = await p(S.player, 'getStatus');
-    if (!st && S.queue) {
-      // no media status at all - the receiver has finished and dropped it
-      return res.json({ connected: true, device: S.device, app: 'Default Media Receiver',
-        state: 'IDLE', position: 0, duration: (S.media || {}).duration || null,
-        volume: null, muted: false, rebuffers: S.rebuffers, media: S.media,
-        auto_refreshes: S.refreshes, expires_in: null,
-        queue: { ...S.queue, total: S.queue.order.length,
-          item: queueItems()[S.queue.order[S.queue.pos]] || null } });
-    }
     let vol = null, muted = false;
     try { const cs = await p(S.client, 'getStatus');
       vol = cs && cs.volume ? cs.volume.level : null; muted = !!(cs && cs.volume && cs.volume.muted); } catch {}
     const state = st ? st.playerState : null;
     if (state === 'BUFFERING' && S.lastState === 'PLAYING') S.rebuffers++;
     S.lastState = state;
+
+    /* The receiver advances the queue on its own, so nothing here is told when
+       the track changes. Report what it is ACTUALLY playing - the item's own
+       customData carries its video id - rather than the last thing this process
+       loaded, which goes stale the moment the speaker moves on. */
+    const rm = st && st.media;
+    const cd = (rm && rm.customData) || {};
+    const liveTitle = cd.title || (rm && rm.metadata && rm.metadata.title) || null;
+    identifyLive(rm);            // no await: re-derives in the background on change
+    const ident = (S.identity && rm && S.identity.contentId === rm.contentId) ? S.identity : null;
+    const live = rm ? {
+      title: liveTitle,
+      duration: rm.duration ?? cd.duration ?? null,
+      video_id: cd.video_id || (ident && ident.video_id) || null,
+      identified: ident ? { confidence: ident.confidence } : undefined,
+      acodec: rm.contentType || null,
+      abr: (S.media && S.media.abr) || null,
+      ext: (S.media && S.media.ext) || null,
+    } : null;
+    const liveExpire = CQ.expiryOf(rm && rm.contentId);
+
     res.json({ connected: true, device: S.device, app: 'Default Media Receiver',
       state, position: (st && st.currentTime) || 0,
-      duration: (st && st.media && st.media.duration) || (S.media && S.media.duration) || null,
+      duration: (live && live.duration) || null,
       volume: vol == null ? null : +vol.toFixed(2), muted, rebuffers: S.rebuffers,
-      media: S.media, auto_refreshes: S.refreshes,
-      queue: S.queue ? { playlistId: S.queue.playlistId, name: S.queue.name,
-        pos: S.queue.pos, total: S.queue.order.length, version: S.queue.version,
-        repeat: S.queue.repeat, shuffle: S.queue.shuffle,
-        item: queueItems()[S.queue.order[S.queue.pos]] || null,
-        can_next: nextPos(1) >= 0, can_prev: nextPos(-1) >= 0 } : null,
-      expires_in: S.expire ? Math.round(S.expire - Date.now() / 1000) : null });
+      media: live, auto_refreshes: S.refreshes,
+      queue: S.qcache ? { pos: S.qcache.pos, total: S.qcache.total,
+        version: S.qcache.version, repeat: S.qcache.repeat,
+        item: S.qcache.items[S.qcache.pos] || null,
+        filling: S.fill ? { done: S.fill.done, total: S.fill.total } : null,
+        can_next: S.qcache.total > 1 || S.qcache.repeat !== 'off',
+        can_prev: S.qcache.total > 1 || S.qcache.repeat !== 'off' } : null,
+      expires_in: liveExpire ? Math.round(liveExpire - Date.now() / 1000) : null });
   } catch (e) { res.json({ connected: true, error: String(e.message || e) }); }
 });
 
@@ -623,7 +701,6 @@ app.post('/api/playlists/:id/rename', (req, res) => {
 
 app.delete('/api/playlists/:id', (req, res) => {
   PL.remove(req.params.id);
-  if (S.queue && S.queue.playlistId === req.params.id) S.queue = null;
   res.json({ ok: true });
 });
 
@@ -655,102 +732,134 @@ app.post('/api/playlists/:id/move', (req, res) => {
 /* ---------- queue ---------- */
 app.post('/api/playlists/:id/play', asyncRoute(async (req, res) => {
   const { index, shuffle, repeat } = req.body || {};
-  const q = await startQueue(req.params.id, parseInt(index, 10) || 0,
-    { shuffle: !!shuffle, repeat: repeat || (S.queue && S.queue.repeat) || 'off' });
-  res.json({ ok: true, queue: q });
+  const pl = PL.get(req.params.id);
+  if (!pl || !pl.items.length) return res.status(400).json({ error: 'playlist is empty' });
+  const entries = shuffle ? shuffledCopy(pl.items) : pl.items;
+  await loadQueue(entries, parseInt(index, 10) || 0, { repeat: repeat || 'off' });
+  await syncQueue();
+  res.json({ ok: true, total: entries.length });
 }));
 
-/* Respond with the target track straight away so the UI can show the change
-   immediately; loading it on the speaker takes seconds and happens after. */
-function skip(dir, res) {
-  if (!S.queue) return res.status(400).json({ error: 'nothing queued' });
-  const np = nextPos(dir);
-  if (np < 0) { S.queue = null; return res.json({ ok: false, ended: true }); }
-  const index = S.queue.order[np];
-  const item = queueItems()[index] || null;
-  S.queue.pos = np;
-  const token = ++advanceToken;
-  res.json({ ok: true, pos: np, index, total: S.queue.order.length, item });
-  playQueuePos(np, token).catch(e => logErr('skip: ' + e.message));
+const shuffledCopy = arr => { const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+/* The receiver owns position, so skipping is a jump instruction to it rather
+   than a track we pick and load ourselves. */
+async function skip(dir, res) {
+  if (!S.player || !S.qcache) return res.status(400).json({ error: 'nothing queued' });
+  try {
+    await p(S.player, 'queueUpdate', [], { jump: dir });
+    const q = await syncQueue();
+    res.json({ ok: true, pos: q ? q.pos : null, total: q ? q.total : null,
+               item: q ? q.items[q.pos] : null });
+  } catch (e) { logErr('skip: ' + e.message); res.status(500).json({ error: String(e.message || e) }); }
 }
 app.post('/api/queue/next', (req, res) => skip(1, res));
 app.post('/api/queue/prev', (req, res) => skip(-1, res));
-/* full queue contents - fetched only when the version changes */
-app.get('/api/queue', (req, res) => res.json(S.queue ? {
-  ...S.queue, items: S.queue.order.map(i => S.queue.items[i]).filter(Boolean),
-} : { empty: true }));
+
+app.post('/api/queue/goto', asyncRoute(async (req, res) => {
+  if (!S.qcache) return res.status(400).json({ error: 'nothing queued' });
+  const pos = parseInt((req.body || {}).pos, 10);
+  const itemId = S.qcache.itemIds[pos];
+  if (itemId == null) return res.status(400).json({ error: 'bad position' });
+  await p(S.player, 'queueUpdate', [], { currentItemId: itemId });
+  const q = await syncQueue();
+  res.json({ ok: true, pos: q ? q.pos : pos, total: q ? q.total : null,
+             item: q ? q.items[q.pos] : null });
+}));
+
+app.post('/api/queue/stop', asyncRoute(async (req, res) => {
+  if (S.player) await p(S.player, 'stop').catch(() => {});
+  S.qcache = null; res.json({ ok: true });
+}));
+
+/* Shuffle has to reorder on the speaker: the receiver's REPEAT_ALL_AND_SHUFFLE
+   only shuffles on wrap-around, which is not what the button implies. */
+app.post('/api/queue/mode', asyncRoute(async (req, res) => {
+  if (!S.player || !S.qcache) return res.status(400).json({ error: 'nothing queued' });
+  const { repeat, shuffle } = req.body || {};
+  if (repeat) await p(S.player, 'queueUpdate', [], { repeatMode: CQ.REPEAT[repeat] || 'REPEAT_OFF' });
+  if (shuffle === true) {
+    const cur = S.qcache.currentItemId;
+    const rest = shuffledCopy(S.qcache.itemIds.filter(i => i !== cur));
+    await p(S.player, 'queueReorder', [cur, ...rest], {});
+  }
+  const q = await syncQueue();
+  res.json({ ok: true, pos: q ? q.pos : null, total: q ? q.total : null });
+}));
+
+/* full queue contents, read from the speaker */
+app.get('/api/queue', asyncRoute(async (req, res) => {
+  const q = S.qcache || await syncQueue();
+  res.json(q ? { pos: q.pos, total: q.total, repeat: q.repeat, version: q.version,
+                 items: q.items } : { empty: true });
+}));
 
 /* append to what is playing: a video url, a playlist url, or a saved playlist */
 app.post('/api/queue/add', asyncRoute(async (req, res) => {
+  if (!S.client) return res.status(400).json({ error: 'not connected' });
   const { url, playlistId } = req.body || {};
+  let entries;
   if (playlistId) {
     const pl = PL.get(playlistId);
     if (!pl) return res.status(404).json({ error: 'no such playlist' });
-    const r = queueAppend(pl.items.map(i => ({ ...i })));
-    return res.json({ ok: true, added: r.added, total: r.queue.order.length });
-  }
-  if (!url) return res.status(400).json({ error: 'no url' });
-  const vid = videoIdOf(url);
-  if (vid && !isPlaylistUrl(url)) {           // fast path, same as adding to a playlist
-    let title = vid;
-    try { const o = await oembed(vid); title = o.title || vid; } catch (e) { logErr('oembed: ' + e.message); }
-    const item = { video_id: vid, title, duration: null,
-      url: 'https://www.youtube.com/watch?v=' + vid,
-      thumb: `https://i.ytimg.com/vi/${vid}/mqdefault.jpg` };
-    const r = queueAppend([item]);
-    res.json({ ok: true, added: r.added, total: r.queue.order.length, title });
-    ytdlp(['-4', '--no-warnings', '--no-playlist', '-J', '--flat-playlist', item.url])
-      .then(o => { const d = JSON.parse(o).duration;
-        const it = (S.queue && S.queue.items.find(x => x.video_id === vid));
-        if (it && d) { it.duration = d; S.queue.version++; } })
-      .catch(e => logErr('queue duration: ' + e.message));
-    return;
-  }
-  const items = await resolveItems(url);
-  if (!items.length) return res.status(400).json({ error: 'nothing found at that url' });
-  const r = queueAppend(items);
-  res.json({ ok: true, added: r.added, total: r.queue.order.length });
+    entries = pl.items;
+  } else if (url) {
+    entries = await resolveItems(url);
+  } else return res.status(400).json({ error: 'no url' });
+  if (!entries.length) return res.status(400).json({ error: 'nothing found at that url' });
+
+  const live = await queueIsLive();
+  res.json({ ok: true, added: entries.length, started: !live });
+  (async () => {
+    if (!live) {                         // nothing playing: this becomes the queue
+      await loadQueue(entries, 0, { repeat: 'off' });
+      await syncQueue();
+      return;
+    }
+    const buf = [];
+    for (const e of entries) {
+      try { buf.push(await asCastItem(e)); } catch (err) { logErr('queue add: ' + err.message); }
+      if (buf.length >= CQ.BATCH) await insertBatched(buf.splice(0));
+    }
+    if (buf.length) await insertBatched(buf);
+    await syncQueue();
+    console.log(`[queue] appended ${entries.length}`);
+  })().catch(async e => {
+    logErr('queue add: ' + e.message);
+    if (/MEDIA_SESSION/i.test(e.message)) {     // session died mid-append
+      try { await loadQueue(entries, 0, { repeat: 'off' }); await syncQueue(); } catch {}
+    }
+  });
 }));
 
-/* jump to a position within the live queue */
-app.post('/api/queue/goto', (req, res) => {
-  if (!S.queue) return res.status(400).json({ error: 'nothing queued' });
-  const pos = parseInt((req.body || {}).pos, 10);
-  if (!(pos >= 0 && pos < S.queue.order.length)) return res.status(400).json({ error: 'bad position' });
-  const index = S.queue.order[pos];
-  const item = queueItems()[index] || null;
-  S.queue.pos = pos;
-  const token = ++advanceToken;
-  res.json({ ok: true, pos, index, total: S.queue.order.length, item });
-  playQueuePos(pos, token).catch(e => logErr('goto: ' + e.message));
-});
-
-app.post('/api/queue/stop', (req, res) => { S.queue = null; res.json({ ok: true }); });
-
-app.post('/api/queue/mode', (req, res) => {
-  if (!S.queue) return res.status(400).json({ error: 'nothing queued' });
-  const { repeat, shuffle } = req.body || {};
-  if (repeat) S.queue.repeat = repeat;
-  if (typeof shuffle === 'boolean' && shuffle !== S.queue.shuffle) {
-    const cur = S.queue.order[S.queue.pos];          // keep playing the same track
-    const n = queueItems().length;
-    S.queue.order = shuffle ? [cur, ...shuffled(n).filter(i => i !== cur)]
-                            : [...Array(n).keys()];
-    S.queue.pos = shuffle ? 0 : cur;
-    S.queue.shuffle = shuffle; S.queue.version++;
-  }
-  res.json({ ok: true, queue: S.queue });
-});
+app.get('/api/diagnostics', (req, res) => res.json({
+  platform: process.platform, arch: process.arch,
+  discovery: S.discovery,
+  interfaces: externalIPv4(),
+  devices_found: DEV.size,
+  device_names: [...DEV.keys()],
+  connected: S.device,
+  recent_errors: S.errors.slice(-5),
+}));
 
 app.get('/api/errors', (req, res) => res.json({ errors: S.errors.slice(-10) }));
 
 function start(port = process.env.PORT || 8765, host = process.env.HOST || '127.0.0.1') {
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     const srv = app.listen(port, host, () => {
       console.log(`\n  YouTube Audio Caster -> http://${host}:${port}\n`);
-      startDiscovery();
       resolve(srv);
+      /* Discovery starts AFTER resolve and cannot take the app down with it.
+         Binding mDNS on udp/5353 fails on plenty of Windows machines - Apple's
+         Bonjour service holds the port, or the firewall blocks it - and this
+         used to run before resolve(), so the promise never settled and the app
+         hung with no window and nothing logged. */
+      try { startDiscovery(); }
+      catch (e) { logErr('discovery unavailable: ' + e.message); }
     });
+    srv.on('error', e => reject(new Error(`cannot listen on ${host}:${port} - ${e.message}`)));
   });
 }
 module.exports = { start, app, S };
