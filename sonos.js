@@ -9,6 +9,50 @@ const xml = value => String(value == null ? '' : value)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 
+/* Sonos stores queue URIs in a 1024-character field. yt-dlp URLs can exceed
+   that with optional player telemetry. Remove only known telemetry and keep
+   the original order and byte encoding of every signed or unknown parameter. */
+function compactMediaUri(value) {
+  const uri = String(value || '');
+  if (uri.length <= 1024) return uri;
+  try {
+    const parsed = new URL(uri);
+    if (!/(^|\.)googlevideo\.com$/i.test(parsed.hostname)) return uri;
+    if (!parsed.searchParams.has('sparams') && !parsed.searchParams.has('lsparams')) return uri;
+    const question = uri.indexOf('?');
+    const end = uri.indexOf('#', question);
+    const queryEnd = end < 0 ? uri.length : end;
+    const removable = new Set(['c', 'fexp', 'fvip', 'keepalive', 'mt', 'txp']);
+    const protectedKeys = new Set([
+      ...(parsed.searchParams.get('sparams') || '').split(','),
+      ...(parsed.searchParams.get('lsparams') || '').split(','),
+    ]);
+    const parts = uri.slice(question + 1, queryEnd).split('&');
+    let query = parts.filter(part => {
+      const rawKey = part.split('=', 1)[0];
+      try {
+        const key = decodeURIComponent(rawKey);
+        return protectedKeys.has(key) || !removable.has(key);
+      }
+      catch { return true; }
+    });
+    let compact = uri.slice(0, question + 1) + query.join('&') + uri.slice(queryEnd);
+    if (compact.length > 1000) {
+      /* Comma, slash and equals are legal inside query values. Decoding only
+         those escapes preserves the value covered by Google's signature while
+         recovering substantial space from sparams/lsparams. */
+      query = query.map(part => {
+        const equals = part.indexOf('=');
+        if (equals < 0) return part;
+        return part.slice(0, equals + 1) + part.slice(equals + 1)
+          .replace(/%(?:2C|2F|3D)/gi, match => decodeURIComponent(match));
+      });
+      compact = uri.slice(0, question + 1) + query.join('&') + uri.slice(queryEnd);
+    }
+    return compact;
+  } catch { return uri; }
+}
+
 const clock = seconds => {
   const n = Math.max(0, Math.floor(Number(seconds) || 0));
   const h = Math.floor(n / 3600);
@@ -21,6 +65,8 @@ const clock = seconds => {
    YouTube id so another instance can recover the synced video without relying
    on the expiring CDN URL. */
 function mediaItem(media, entry = {}) {
+  const uri = compactMediaUri(media.url);
+  if (uri.length > 1024) throw new Error('This YouTube stream URL is too long for the Sonos queue');
   const videoId = entry.video_id || media.video_id || '';
   const title = media.title || entry.title || 'audio';
   const duration = media.duration ?? entry.duration ?? 0;
@@ -36,10 +82,10 @@ function mediaItem(media, entry = {}) {
     + '<upnp:class>object.item.audioItem.musicTrack</upnp:class>';
   if (thumb) metadata += `<upnp:albumArtURI>${xml(thumb)}</upnp:albumArtURI>`;
   metadata += `<res protocolInfo="http-get:*:${xml(ctype)}:*" duration="${clock(duration)}">`
-    + `${xml(media.url)}</res></item></DIDL-Lite>`;
+    + `${xml(uri)}</res></item></DIDL-Lite>`;
   /* String metadata is inserted verbatim by @svrooij/sonos, so encode the
      complete DIDL document for its outer SOAP XML. */
-  return { uri: media.url, metadata: xml(metadata) };
+  return { uri, metadata: xml(metadata) };
 }
 
 const videoIdFromArt = art => {
@@ -66,8 +112,8 @@ function describeQueueItem(item, index, lookup = () => null) {
     video_id: videoId,
     url: (hit && hit.src_url) || (videoId
       ? `https://www.youtube.com/watch?v=${videoId}` : null),
-    title: (item && item.title) || (hit && hit.title) || '(unknown)',
-    duration: (item && item.duration) ?? (hit && hit.duration) ?? null,
+    title: (hit && hit.title) || (item && item.title) || '(unknown)',
+    duration: (item && item.duration) || (hit && hit.duration) || null,
     thumb: videoId ? `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`
       : (item && (item.albumArtURI || item.albumArtURL)) || null,
     expires: expiryOf(uri),
@@ -178,8 +224,12 @@ class SonosController {
   selectQueue() { return this.device.SwitchToQueue(); }
 
   queue(item, position = 0) {
+    /* BaseService runs encodeURI() on URI strings, double-encoding yt-dlp's
+       existing %XX escapes. A string-like object bypasses that conversion while
+       still inserting an XML-escaped URI into the SOAP body. */
+    const literalUri = { toString: () => xml(item.uri) };
     return this.device.AVTransportService.AddURIToQueue({ InstanceID: 0,
-      EnqueuedURI: xml(item.uri), EnqueuedURIMetaData: item.metadata || '',
+      EnqueuedURI: literalUri, EnqueuedURIMetaData: item.metadata || '',
       DesiredFirstTrackNumberEnqueued: position, EnqueueAsNext: false });
   }
 
@@ -502,5 +552,5 @@ class SonosManager {
 }
 
 module.exports = { ACTIVE_STATES, REPEAT_TO_SONOS, SonosController, SonosManager, clock, expiryOf,
-  mediaItem, videoIdFromArt, hostFromMdns, describeQueueItem, repeatFromSonos, playModeFor,
-  normalizeGroups };
+  compactMediaUri, mediaItem, videoIdFromArt, hostFromMdns, describeQueueItem, repeatFromSonos,
+  playModeFor, normalizeGroups };

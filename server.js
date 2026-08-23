@@ -53,6 +53,16 @@ async function extract(pageUrl) {
     thumb: info.thumbnail || null, video_id: info.id };
 }
 
+async function validateSonosUri(original, item) {
+  if (item.uri === original) return item;
+  const response = await fetch(item.uri, {
+    headers: { Range: 'bytes=0-0' }, signal: AbortSignal.timeout(8000),
+  });
+  if (!response.ok) throw new Error(`YouTube rejected the shortened Sonos stream URL (${response.status})`);
+  if (response.body) await response.body.cancel();
+  return item;
+}
+
 
 /* oEmbed is one HTTP request and returns in ~0.1s. yt-dlp needs ~8s for the same
    video because it makes several sequential calls to YouTube's player APIs. Use
@@ -433,7 +443,8 @@ async function sonosMedia(track) {
   if (hit && hit.src_url) S.srcUrl = hit.src_url;
   S.expire = SO.expiryOf(contentId); S.cdnUrl = contentId;
   return {
-    title: track.title || '(already playing)', duration: track.duration || null,
+    title: (hit && hit.title) || track.title || '(already playing)',
+    duration: track.duration || (hit && hit.duration) || null,
     acodec: (S.media && S.media.acodec) || null,
     abr: (S.media && S.media.abr) || null, ext: (S.media && S.media.ext) || null,
     video_id: videoId || null,
@@ -543,11 +554,12 @@ async function castUrl(pageUrl, name) {
   const connection = await connectDevice(name);
   const m = await extract(pageUrl);
   if (connection.sonos) {
-    try { await S.sonos.stop(); } catch {}
-    await S.sonos.flush();
-    const queued = await S.sonos.queue(SO.mediaItem(m, {
+    const item = await validateSonosUri(m.url, SO.mediaItem(m, {
       video_id: m.video_id, title: m.title, duration: m.duration, url: pageUrl, thumb: m.thumb,
     }));
+    try { await S.sonos.stop(); } catch {}
+    await S.sonos.flush();
+    const queued = await S.sonos.queue(item);
     await S.sonos.selectQueue();
     await S.sonos.selectTrack(Number(queued.FirstTrackNumberEnqueued) || 1);
     await S.sonos.setPlayMode('NORMAL');
@@ -649,7 +661,9 @@ const asCastItem = async entry => CQ.item(await extract(entry.url), entry);
 const asSonosItem = async (entry, queueOwned = false) => {
   const media = await extract(entry.url);
   remember(media.video_id || entry.video_id, entry.url, media.title, media.duration, media.url, null);
-  return { ...SO.mediaItem(media, { ...entry, queue_owned: queueOwned }),
+  const item = await validateSonosUri(media.url,
+    SO.mediaItem(media, { ...entry, queue_owned: queueOwned }));
+  return { ...item,
     _media: media, _entry: entry };
 };
 

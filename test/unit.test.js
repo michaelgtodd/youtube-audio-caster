@@ -322,18 +322,55 @@ test('Sonos queue SOAP inputs escape CDN query strings exactly once', async () =
   let sent = null;
   const service = { AddURIToQueue: async input => { sent = input; return { FirstTrackNumberEnqueued: 1 }; } };
   const controller = new SO.SonosController({ Coordinator: null, AVTransportService: service });
-  const item = SO.mediaItem({ url: 'https://cdn/play?x=1&y=2', title: 'A & B',
+  const item = SO.mediaItem({ url: 'https://cdn/play?x=a%2Cb&y=2', title: 'A & B',
     ctype: 'audio/mp4', video_id: 'I5noeDaJaFQ' }, { video_id: 'I5noeDaJaFQ' });
   await controller.queue(item);
-  assert.strictEqual(sent.EnqueuedURI, 'https://cdn/play?x=1&amp;y=2');
+  assert.strictEqual(String(sent.EnqueuedURI), 'https://cdn/play?x=a%2Cb&amp;y=2');
   assert.strictEqual(sent.EnqueueAsNext, false);
   assert.match(sent.EnqueuedURIMetaData, /A &amp;amp; B/);
-  assert.match(sent.EnqueuedURIMetaData, /https:\/\/cdn\/play\?x=1&amp;amp;y=2/);
+  assert.match(sent.EnqueuedURIMetaData, /https:\/\/cdn\/play\?x=a%2Cb&amp;amp;y=2/);
   const device = new (require('@svrooij/sonos').SonosDevice)('127.0.0.1');
   const body = device.AVTransportService.generateRequestBody('AddURIToQueue', sent);
-  assert.match(body, /<EnqueuedURI>https:\/\/cdn\/play\?x=1&amp;y=2<\/EnqueuedURI>/);
+  assert.match(body, /<EnqueuedURI>https:\/\/cdn\/play\?x=a%2Cb&amp;y=2<\/EnqueuedURI>/);
+  assert.doesNotMatch(body, /%252C/);
   assert.match(body, /<EnqueuedURIMetaData>&lt;DIDL-Lite/);
   assert.match(body, /&lt;res protocolInfo=/);
+});
+
+test('Sonos strips unsigned Google telemetry to fit its queue URI limit', () => {
+  const uri = 'https://rr1.googlevideo.com/videoplayback?expire=99&id=track&mime=audio%2Fmp4'
+    + '&sparams=expire%2Cid%2Cmime&sig=signed&lsparams=mh&lsig=local&mh=tk'
+    + '&fexp=' + '1'.repeat(1100) + '&c=VISIONOS&txp=5511222';
+  const compact = SO.compactMediaUri(uri);
+  assert.ok(compact.length < 1024);
+  assert.strictEqual(new URL(compact).searchParams.get('mime'), 'audio/mp4');
+  assert.strictEqual(new URL(compact).searchParams.get('sig'), 'signed');
+  assert.strictEqual(new URL(compact).searchParams.has('fexp'), false);
+});
+
+test('Sonos URL compaction preserves raw signed and unknown parameters', () => {
+  const uri = 'https://rr1.googlevideo.com/videoplayback?expire=99&sparams=expire'
+    + '&sig=a%20b&unknown=x%2Fy&fexp=' + '1'.repeat(1100);
+  const compact = SO.compactMediaUri(uri);
+  assert.match(compact, /sig=a%20b/);
+  assert.match(compact, /unknown=x%2Fy/);
+
+  const unsigned = 'https://rr1.googlevideo.com/videoplayback?required='
+    + 'x'.repeat(1100) + '&fexp=123';
+  assert.strictEqual(SO.compactMediaUri(unsigned), unsigned);
+  assert.throws(() => SO.mediaItem({ url: unsigned }), /too long for the Sonos queue/);
+
+  const signedTelemetry = 'https://rr1.googlevideo.com/videoplayback?expire=99&c=VISIONOS'
+    + '&sparams=expire%2Cc&sig=signed&fexp=' + '1'.repeat(1100);
+  assert.strictEqual(new URL(SO.compactMediaUri(signedTelemetry)).searchParams.get('c'), 'VISIONOS');
+
+  const descriptors = 'https://rr1.googlevideo.com/videoplayback?expire=99&sig='
+    + 's'.repeat(1100) + '&sparams=expire&lsparams=mh&lsig=local&mh=tk&fexp=' + '1'.repeat(200);
+  const compactDescriptors = SO.compactMediaUri(descriptors);
+  assert.strictEqual(new URL(compactDescriptors).searchParams.has('sparams'), true);
+  assert.strictEqual(new URL(compactDescriptors).searchParams.has('lsparams'), true);
+  assert.strictEqual(new URL(compactDescriptors).searchParams.get('sig'), 's'.repeat(1100));
+  assert.throws(() => SO.mediaItem({ url: descriptors }), /too long for the Sonos queue/);
 });
 
 test('Sonos groups become one stable coordinator target', () => {
@@ -373,10 +410,12 @@ test('Sonos queue identity survives through album art or the session store', () 
   assert.strictEqual(fromArt.expires, 1787464000);
 
   const recalled = SO.describeQueueItem({ uri: 'opaque', title: 'Stored' }, 0, () => ({
-    video_id: 'aaaaaaaaaaa', src_url: 'https://youtu.be/aaaaaaaaaaa', duration: 42,
+    video_id: 'aaaaaaaaaaa', src_url: 'https://youtu.be/aaaaaaaaaaa',
+    title: 'Stored title', duration: 42,
   }));
   assert.strictEqual(recalled.video_id, 'aaaaaaaaaaa');
   assert.strictEqual(recalled.url, 'https://youtu.be/aaaaaaaaaaa');
+  assert.strictEqual(recalled.title, 'Stored title');
   assert.strictEqual(recalled.duration, 42);
 
   const owned = SO.describeQueueItem({ uri: 'u', itemId: 'youtube-queue:aaaaaaaaaaa' }, 0);
