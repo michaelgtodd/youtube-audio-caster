@@ -41,8 +41,27 @@ jobs:
             sleep 1
             if [ "$i" = "30" ]; then echo "SERVER NEVER ANSWERED"; cat server.log; exit 1; fi
           done
-          echo "--- /api/devices (discovery may be blocked here; it must still reply) ---"
-          curl -s --max-time 25 "http://127.0.0.1:8931/api/devices" | head -c 400; echo
+          echo "--- every endpoint must answer with sane json ---"
+          for EP in /api/devices /api/playlists /api/queue /api/status /api/jobs /api/errors; do
+            BODY=$(curl -s --max-time 25 "http://127.0.0.1:8931$EP")
+            echo "$BODY" | node -e "
+              let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+                try { JSON.parse(d); console.log('  ok   $EP  ' + d.slice(0,70)); }
+                catch(e){ console.log('  BAD  $EP  not json: ' + d.slice(0,70)); process.exit(1); }
+              })"
+          done
+          echo "--- playlist round trip through the api ---"
+          ID=$(curl -s -X POST -H 'Content-Type: application/json' -d '{"name":"CI"}' \
+                 http://127.0.0.1:8931/api/playlists \
+               | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).playlist.id))")
+          curl -s -X POST -H 'Content-Type: application/json' -d '{"name":"CI renamed"}' \
+            "http://127.0.0.1:8931/api/playlists/$ID/rename" >/dev/null
+          curl -s "http://127.0.0.1:8931/api/playlists" | node -e "
+            let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+              const p=JSON.parse(d).playlists[0];
+              if(!p||p.name!=='CI renamed'){console.log('  playlist round trip FAILED');process.exit(1);}
+              console.log('  playlist create+rename ok');})"
+          curl -s -X DELETE "http://127.0.0.1:8931/api/playlists/$ID" >/dev/null
           echo "--- server log ---"; cat server.log
 
       # 2. the whole Electron startup path, which is what actually failed
@@ -62,6 +81,43 @@ jobs:
               exit 1; fi
           done
           echo "--- electron log ---"; cat electron.log
+
+      # The failures that actually reached users were renderer-side: a handler
+      # bound to an element that did not exist, window.prompt throwing, a css
+      # rule that could never hide a block. Load the real UI and check it.
+      - name: UI loads and works
+        shell: bash
+        run: npx electron test/renderer-smoke.js
+
+      # The steps above run the source tree, where every file exists by
+      # definition. A file missing from the BUILD only shows up in the packaged
+      # app - which is how a "cannot find module castqueue.js" crash reached a
+      # tester. Build it and run the real artifact.
+      - name: Packaged app starts
+        shell: bash
+        run: |
+          pkill -f "electron" 2>/dev/null || taskkill //IM electron.exe //F 2>/dev/null || true
+          sleep 2
+          npx electron-builder --dir --publish never 2>&1 | tail -3
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN=$(find dist -maxdepth 2 -name '*.exe' -path '*unpacked*' | head -1)
+          else
+            BIN=$(find dist -maxdepth 4 -path '*.app/Contents/MacOS/*' -type f | head -1)
+          fi
+          echo "packaged binary: $BIN"
+          [ -n "$BIN" ] || { echo "NO PACKAGED BINARY FOUND"; ls -R dist | head -30; exit 1; }
+          "$BIN" > packaged.log 2>&1 &
+          for i in $(seq 1 45); do
+            PORT=$(grep -oE '127\.0\.0\.1:[0-9]+' packaged.log 2>/dev/null | head -1 | cut -d: -f2 || true)
+            if [ -n "$PORT" ] && curl -sf --max-time 3 "http://127.0.0.1:$PORT/" >/dev/null; then
+              echo "PACKAGED app served its UI on port $PORT after ${i}s"; break; fi
+            sleep 1
+            if [ "$i" = "45" ]; then
+              echo "PACKAGED APP FAILED TO START - a file is probably missing from build.files"
+              echo "--- packaged log ---"; cat packaged.log
+              exit 1; fi
+          done
+          echo "--- packaged log ---"; cat packaged.log
 
       - name: No startup error was recorded
         shell: bash
