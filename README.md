@@ -116,9 +116,9 @@ screen with nothing else on it. Press Esc to come back from either.
 ## Good to know
 
 - Works with YouTube links only
-- Cast and Sonos discovery both require the computer and speakers to be on the same
-  local network. Firewalls must allow mDNS on UDP 5353 for Cast and SSDP on UDP 1900
-  for Sonos.
+- Cast and Sonos discovery both require the computer and speakers to be reachable on
+  the local network. Firewalls must allow mDNS on UDP 5353; Sonos can also be found
+  directly through SSDP on UDP 1900.
 - A Sonos group appears as one target and is controlled through its current
   coordinator, matching how the Sonos app treats grouped rooms.
 - If videos suddenly stop loading, YouTube has probably changed something — run

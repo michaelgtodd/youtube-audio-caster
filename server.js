@@ -215,6 +215,7 @@ const externalIPv4 = () => Object.entries(os.networkInterfaces()).flatMap(
     .map(a => ({ name, address: a.address })));
 
 let browsers = [];            // one per interface
+let discoveryTimer = null;
 S.discovery = { started: false, interfaces: [], error: null };
 
 function startDiscovery() {
@@ -228,7 +229,8 @@ function startDiscovery() {
       const b = new Bonjour(opts);
       const br = b.find({ type: 'googlecast' }, addService);
       if (br.on) br.on('up', addService);
-      browsers.push({ label, bonjour: b, browser: br });
+      const sonos = b.find({ type: 'sonos' }, service => SONOS.addMdnsService(service));
+      browsers.push({ label, bonjour: b, browser: br, sonosBrowser: sonos });
       S.discovery.interfaces.push({ label, ok: true });
       return true;
     } catch (e) {
@@ -251,30 +253,46 @@ function startDiscovery() {
   }
   S.discovery.started = true;
   if (browsers.length) {
-    setInterval(() => { for (const b of browsers) { try { b.browser.update(); } catch {} } }, 20000).unref();
+    discoveryTimer = setInterval(() => { for (const b of browsers) {
+      try { b.browser.update(); } catch {}
+      try { b.sonosBrowser.update(); } catch {}
+    } }, 20000).unref();
   }
-  console.log(`[discovery] Cast on ${browsers.length} interface(s); Sonos SSDP `
+  console.log(`[discovery] Cast and Sonos mDNS on ${browsers.length} interface(s); Sonos SSDP `
     + (SONOS.diagnostics().started ? 'started' : 'unavailable'));
 }
 
 /* Wait until the device set stops growing. If `want` is given, do not settle
    until that device has answered - devices reply at their own pace, and
    returning a partial list means the caller silently misses a speaker. */
-async function discover(ms = 9000, want = null) {
+async function discover(ms = 9000, want = null, forceSonos = false) {
   // must not throw: the caller needs to reach the "discovery is blocked" reply
   try { startDiscovery(); } catch { /* recorded in S.discovery.error */ }
-  for (const b of browsers) { try { b.browser.update(); } catch {} }
+  for (const b of browsers) {
+    try { b.browser.update(); } catch {}
+    try { b.sonosBrowser.update(); } catch {}
+  }
   const deadline = Date.now() + ms;
+  const refreshSonos = async force => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return;
+    let timer;
+    await Promise.race([
+      SONOS.refresh(force).catch(() => {}),
+      new Promise(resolve => { timer = setTimeout(resolve, remaining); }),
+    ]);
+    clearTimeout(timer);
+  };
   const floor = Date.now() + 3500;
   let last = -1, stable = 0;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 700));
-    await SONOS.refresh().catch(() => {});
+    await refreshSonos(false);
     const count = DEV.size + SONOS.devices().length;
     const settled = count === last ? ++stable >= 5 : (stable = 0, last = count, false);
     if (settled && count > 0 && Date.now() > floor && (!want || findDevice(want))) break;
   }
-  await SONOS.refresh(false).catch(() => {});
+  await refreshSonos(forceSonos);
   if (want && !findDevice(want)) console.log(`[discovery] ${want} did not answer in ${ms}ms`);
   return deviceList();
 }
@@ -969,15 +987,21 @@ app.get('/api/devices', async (req, res) => {
   try {
     /* The first answer has to be a settled list. Devices reply to mDNS at their
        own pace, and returning early is how the picker ends up short. */
-    if (req.query.refresh === '1' || !settledOnce) {
-      await discover(req.query.refresh === '1' ? 15000 : 12000);
+    const force = req.query.refresh === '1';
+    if (force || !settledOnce) {
+      await discover(force ? 15000 : 12000, null, force);
       settledOnce = true;
-    }
-    await SONOS.refresh(req.query.refresh === '1').catch(() => {});
+    } else await SONOS.refresh(false).catch(() => {});
     if (S.protocol === 'sonos' && S.device) {
       S.device = SONOS.resolveKey(S.device);
       const selected = SONOS.devices().find(d => d.key === S.device);
-      if (selected) S.deviceName = selected.name;
+      if (selected) {
+        S.deviceName = selected.name;
+        if (!SONOS.controllerMatches(selected, S.sonos, S.sonosGroup)) {
+          const ctl = SONOS.controller(selected);
+          S.sonos = ctl.player; S.sonosGroup = ctl.group;
+        }
+      }
     }
     const devices = deviceList();
     if ((S.discoveryError || SONOS.diagnostics().error) && !devices.length) {
@@ -1347,7 +1371,13 @@ function start(port = process.env.PORT || 8765, host = process.env.HOST || '127.
     srv.on('error', e => reject(new Error(`cannot listen on ${host}:${port} - ${e.message}`)));
   });
 }
-function shutdown() { SONOS.stop(); }
+function shutdown() {
+  if (discoveryTimer) clearInterval(discoveryTimer);
+  discoveryTimer = null;
+  for (const browser of browsers) { try { browser.bonjour.destroy(); } catch {} }
+  browsers = [];
+  SONOS.stop();
+}
 
 module.exports = { start, shutdown, app, S };
 if (require.main === module) start();

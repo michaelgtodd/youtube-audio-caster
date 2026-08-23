@@ -354,6 +354,14 @@ test('Sonos groups become one stable coordinator target', () => {
   assert.strictEqual(groups[0].is_group, true);
 });
 
+test('Sonos mDNS discovery extracts the port-1400 topology host', () => {
+  assert.strictEqual(SO.hostFromMdns({ txt: {
+    location: 'http://10.6.30.169:1400/xml/device_description.xml',
+  }, addresses: ['192.168.20.10'] }), '10.6.30.169');
+  assert.strictEqual(SO.hostFromMdns({ addresses: ['fe80::1', '10.2.91.177'] }), '10.2.91.177');
+  assert.strictEqual(SO.hostFromMdns({ addresses: ['fe80::1'] }), null);
+});
+
 test('Sonos queue identity survives through album art or the session store', () => {
   const fromArt = SO.describeQueueItem({
     uri: 'https://cdn/x?expire=1787464000', title: 'Track',

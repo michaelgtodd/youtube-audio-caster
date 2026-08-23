@@ -47,6 +47,15 @@ const videoIdFromArt = art => {
   return match ? match[1] : null;
 };
 
+function hostFromMdns(service) {
+  try {
+    const location = service && service.txt && service.txt.location;
+    if (location) return new URL(location).hostname;
+  } catch {}
+  return ((service && service.addresses) || [])
+    .find(address => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(address)) || null;
+}
+
 function describeQueueItem(item, index, lookup = () => null) {
   const uri = item && item.uri;
   const hit = lookup({ content_id: uri, title: item && item.title }) || null;
@@ -230,6 +239,7 @@ class SonosManager {
   constructor(lib = SonosLib) {
     this.lib = lib;
     this.search = null;
+    this.discovery = null;
     this.starting = null;
     this.groups = new Map();
     this.nativeByKey = new Map();
@@ -238,15 +248,27 @@ class SonosManager {
     this.lastRefresh = 0;
     this.lastAttempt = 0;
     this.refreshing = null;
+    this.mdnsStarting = null;
+    this.mdnsHosts = new Set();
+    this.lastMdnsAttempt = 0;
+    this.source = null;
     this.error = null;
+    this.onError = () => {};
+    this.generation = 0;
+    this.stopped = false;
   }
 
   start(onError = () => {}) {
+    this.onError = onError;
+    this.stopped = false;
     if (this.search) return true;
     try {
-      this.search = new this.lib.SonosManager();
+      const generation = ++this.generation;
+      const manager = new this.lib.SonosManager();
+      this.search = manager;
       this.lastAttempt = Date.now();
       const discovery = new this.lib.SonosDeviceDiscovery();
+      this.discovery = discovery;
       for (const method of ['addMembership', 'setMulticastTTL']) {
         const original = discovery.socket[method].bind(discovery.socket);
         discovery.socket[method] = (...args) => {
@@ -255,22 +277,110 @@ class SonosManager {
         };
       }
       discovery.socket.on('error', err => {
+        if (generation !== this.generation || this.stopped) return;
         this.error = err.message;
         onError(err);
         process.nextTick(() => discovery.events.emit('timeout'));
       });
-      this.starting = timed(this.search.InitializeWithDiscovery(5, discovery), 7000, 'Sonos discovery')
-        .then(() => { this.syncManagedDevices(); this.error = null; })
+      let expired = false;
+      const initializing = manager.InitializeWithDiscovery(5, discovery);
+      const attempt = timed(initializing, 7000, 'Sonos discovery')
+        .then(() => {
+          if (generation !== this.generation || this.stopped || this.search !== manager) {
+            try { manager.CancelSubscription(); } catch {}
+            return;
+          }
+          this.syncManagedDevices(); this.source = 'ssdp'; this.error = null;
+        })
         .catch(err => {
-        this.error = err.message;
-        onError(err);
-      }).finally(() => { this.starting = null; });
+          if (generation !== this.generation || this.stopped) return;
+          expired = true;
+          this.error = err.message;
+          if (!/No players found/i.test(err.message)) onError(err);
+        }).finally(() => {
+          if (this.starting === attempt) this.starting = null;
+          if (this.discovery === discovery) this.discovery = null;
+        });
+      initializing.then(() => {
+        if (expired || generation !== this.generation || this.stopped || this.search !== manager) {
+          try { manager.CancelSubscription(); } catch {}
+        }
+      }).catch(() => {});
+      this.starting = attempt;
       return true;
     } catch (err) {
       this.error = err.message;
       onError(err);
       return false;
     }
+  }
+
+  addMdnsService(service) {
+    const host = hostFromMdns(service);
+    if (!host || this.stopped) return;
+    const before = this.mdnsHosts.size;
+    this.mdnsHosts.add(host);
+    /* Routed networks often relay mDNS but not SSDP. Once mDNS gives us a
+       concrete player, do not wait out a search that cannot cross the VLAN. */
+    if (this.mdnsHosts.size !== before && this.starting && this.discovery) {
+      const discovery = this.discovery;
+      process.nextTick(() => {
+        if (this.discovery === discovery) {
+          discovery.events.emit('timeout');
+          try { discovery.Cancel(); } catch {}
+        }
+      });
+    }
+  }
+
+  async initializeFromMdns(force = false) {
+    if (this.groups.size || !this.mdnsHosts.size) return this.devices();
+    if (this.mdnsStarting) return this.mdnsStarting;
+    if (!force && Date.now() - this.lastMdnsAttempt < 6000) return this.devices();
+    this.lastMdnsAttempt = Date.now();
+    const generation = ++this.generation;
+    const attempt = (async () => {
+      let lastError = null;
+      /* An mDNS record should identify a live host. Try a few records in case
+         one disappeared between its announcement and this topology request. */
+      const candidates = [...this.mdnsHosts].slice(0, 3);
+      for (const host of candidates) {
+        const manager = new this.lib.SonosManager();
+        const initializing = manager.InitializeFromDevice(host);
+        try {
+          await timed(initializing, 3000, `Sonos at ${host}`);
+          if (generation !== this.generation || this.stopped) {
+            try { manager.CancelSubscription(); } catch {}
+            return this.devices();
+          }
+          try { this.search && this.search.CancelSubscription(); } catch {}
+          this.search = manager;
+          this.syncManagedDevices();
+          this.source = 'mdns';
+          this.error = null;
+          return this.devices();
+        } catch (err) {
+          lastError = err;
+          try { manager.CancelSubscription(); } catch {}
+          /* timed() cannot cancel the library's HTTP work. If it completes
+             later and subscribes, remove that abandoned subscription too. */
+          initializing.then(() => {
+            if (this.search !== manager) {
+              try { manager.CancelSubscription(); } catch {}
+            }
+          }).catch(() => {});
+        }
+      }
+      if (lastError && generation === this.generation && !this.stopped) {
+        /* Move failed records behind untried ones for the next bounded pass. */
+        for (const host of candidates) { this.mdnsHosts.delete(host); this.mdnsHosts.add(host); }
+        this.error = lastError.message;
+        this.onError(lastError);
+      }
+      return this.devices();
+    })().finally(() => { if (this.mdnsStarting === attempt) this.mdnsStarting = null; });
+    this.mdnsStarting = attempt;
+    return attempt;
   }
 
   syncManagedDevices() {
@@ -303,47 +413,57 @@ class SonosManager {
   }
 
   async refresh(force = false) {
+    if (this.stopped) return this.devices();
+    if (this.refreshing) return this.refreshing;
+    const attempt = this.refreshNow(force)
+      .finally(() => { if (this.refreshing === attempt) this.refreshing = null; });
+    this.refreshing = attempt;
+    return attempt;
+  }
+
+  async refreshNow(force = false) {
+    if (this.stopped) return this.devices();
     if (!this.search) this.start();
     if (this.starting) await this.starting;
+    if (this.stopped) return this.devices();
+    if (!this.groups.size && this.mdnsHosts.size) await this.initializeFromMdns(force);
+    if (this.stopped) return this.devices();
     if ((force || Date.now() - this.lastAttempt > 20000) && this.error && !this.groups.size) {
       try { this.search && this.search.CancelSubscription(); } catch {}
       this.search = null;
       this.start();
       if (this.starting) await this.starting;
+      if (this.stopped) return this.devices();
     }
     if (!this.search) return this.devices();
     if (!force && Date.now() - this.lastRefresh < 6000) return this.devices();
-    if (this.refreshing) return this.refreshing;
-    this.refreshing = (async () => {
-      this.syncManagedDevices();
-      const groups = this.devices();
-      await Promise.all(groups.map(async group => {
-        const native = this.nativeByKey.get(group.key);
-        const player = new SonosController(native);
-        try {
-          const state = await timed(player.getCurrentState(), 3000, 'Sonos state');
-          group.busy = ACTIVE_STATES.has(state);
-          if (group.busy) {
-            try {
-              const track = await timed(player.currentTrack(), 3000, 'Sonos track');
-              group.status_text = track.title || state;
-            } catch { group.status_text = state; }
-          }
-          this.failures.delete(group.key);
-        } catch {
-          const failures = (this.failures.get(group.key) || 0) + 1;
-          this.failures.set(group.key, failures);
-          if (failures >= 3) {
-            this.groups.delete(group.key);
-            this.nativeByKey.delete(group.key);
-          }
+    this.syncManagedDevices();
+    const groups = this.devices();
+    await Promise.all(groups.map(async group => {
+      const native = this.nativeByKey.get(group.key);
+      const player = new SonosController(native);
+      try {
+        const state = await timed(player.getCurrentState(), 3000, 'Sonos state');
+        group.busy = ACTIVE_STATES.has(state);
+        if (group.busy) {
+          try {
+            const track = await timed(player.currentTrack(), 3000, 'Sonos track');
+            group.status_text = track.title || state;
+          } catch { group.status_text = state; }
         }
-      }));
-      if (groups.length) this.error = null;
-      this.lastRefresh = Date.now();
-      return this.devices();
-    })().finally(() => { this.refreshing = null; });
-    return this.refreshing;
+        this.failures.delete(group.key);
+      } catch {
+        const failures = (this.failures.get(group.key) || 0) + 1;
+        this.failures.set(group.key, failures);
+        if (failures >= 3) {
+          this.groups.delete(group.key);
+          this.nativeByKey.delete(group.key);
+        }
+      }
+    }));
+    if (groups.length) this.error = null;
+    this.lastRefresh = Date.now();
+    return this.devices();
   }
 
   devices() { return [...this.groups.values()]; }
@@ -359,16 +479,28 @@ class SonosManager {
     };
   }
 
+  controllerMatches(device, player, group) {
+    const native = device && this.nativeByKey.get(device.key);
+    return !!native && player && group && player.source === native && group.source === native;
+  }
+
   diagnostics() {
     return { started: !!this.search,
-      groups: this.groups.size, error: this.error };
+      groups: this.groups.size, source: this.source,
+      mdns_hosts: this.mdnsHosts.size, error: this.error };
   }
 
   stop() {
+    this.stopped = true;
+    this.generation++;
+    try { this.discovery && this.discovery.Cancel(); } catch {}
     try { this.search && this.search.CancelSubscription(); } catch {}
-    this.search = null;
+    this.discovery = null; this.search = null; this.starting = null; this.mdnsStarting = null;
+    this.refreshing = null;
+    this.groups.clear(); this.nativeByKey.clear(); this.keyByMember.clear();
   }
 }
 
 module.exports = { ACTIVE_STATES, REPEAT_TO_SONOS, SonosController, SonosManager, clock, expiryOf,
-  mediaItem, videoIdFromArt, describeQueueItem, repeatFromSonos, playModeFor, normalizeGroups };
+  mediaItem, videoIdFromArt, hostFromMdns, describeQueueItem, repeatFromSonos, playModeFor,
+  normalizeGroups };
