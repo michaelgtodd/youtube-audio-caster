@@ -1102,9 +1102,12 @@ test('macOS reports the SMAppService status, including one that needs approving'
   assert.strictEqual(approval.enabled, true);
   assert.match(approval.reason, /System Settings/);
 
-  const missing = agentFor('not-found').status();
-  assert.strictEqual(missing.enabled, false);
-  assert.match(missing.reason, /could not find/);
+  /* REGRESSION: not-found is what an unpackaged build reports before anyone has
+     asked for anything - a fresh CI runner read it on the very first poll and
+     then enabled successfully. Explaining a failure there opened the pane with
+     an error message describing nothing that had happened. */
+  assert.deepStrictEqual(agentFor('not-found').status(),
+    { supported: true, enabled: false, reason: null });
 
   // older macOS and MAS builds report no status at all
   const legacy = LAUNCH.createLaunchAgent({
@@ -1120,7 +1123,15 @@ test('a login-item write that did not take is thrown rather than reported as don
   const refuses = fakeElectronApp({ settings: { status: 'not-registered' } });
   refuses.setLoginItemSettings = () => undefined;      // accepted, and did nothing
   const agent = LAUNCH.createLaunchAgent({ app: refuses, platform: 'darwin', env: {} });
-  assert.throws(() => agent.set(true), /refused to add/);
+  assert.throws(() => agent.set(true), /did not accept the login item/);
+
+  /* The same status that says nothing on an idle read IS the diagnosis once a
+     write was asked for, so the explanation has to arrive here instead. */
+  const unbundled = fakeElectronApp({ settings: { status: 'not-found' } });
+  unbundled.setLoginItemSettings = () => undefined;
+  assert.throws(
+    () => LAUNCH.createLaunchAgent({ app: unbundled, platform: 'darwin', env: {} }).set(true),
+    /Applications folder/);
 
   const stuck = fakeElectronApp({ settings: { status: 'enabled', openAtLogin: true } });
   stuck.setLoginItemSettings = () => undefined;

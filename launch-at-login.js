@@ -58,7 +58,22 @@ const DARWIN_STATUS = {
   'enabled-deprecated': { enabled: true, reason: null },
   'requires-approval': { enabled: true, reason: APPROVAL_REASON },
   'not-registered': { enabled: false, reason: null },
-  'not-found': { enabled: false, reason: 'macOS could not find the app to register.' },
+  /* not-found is what an unpackaged or relocated build reports, and on a machine
+     that has never been asked for anything it is simply "off" - opening the pane
+     with a sentence about a failure, before anyone has touched the checkbox, is
+     reporting an error where nothing has gone wrong. Seen on a fresh CI runner:
+     the very first read came back not-found, and the enable that followed it
+     worked. It only means something once a write was asked for and did not
+     take, so its explanation lives on the write path instead. */
+  'not-found': { enabled: false, reason: null },
+};
+
+/* Said only when a write was asked for and the state did not move, where the
+   status IS the diagnosis rather than an idle observation. */
+const WRITE_FAILURE = {
+  'not-found': 'macOS would not register the app. Login items have to come from an '
+    + 'installed copy - move YouTube Audio Caster to your Applications folder and try again.',
+  'not-registered': 'macOS did not accept the login item.',
 };
 
 function createLaunchAgent({ app, platform = process.platform, env = process.env } = {}) {
@@ -68,27 +83,31 @@ function createLaunchAgent({ app, platform = process.platform, env = process.env
   const isWindows = platform === 'win32';
   const optionsFor = () => (isWindows ? windowsOptions(app, env) : undefined);
 
+  const readSettings = () => app.getLoginItemSettings(optionsFor()) || {};
+
+  function describe(settings) {
+    const mapped = !isWindows && DARWIN_STATUS[settings.status];
+    if (mapped) return { supported: true, ...mapped };
+    /* openAtLogin is the field that answers the question actually asked: on
+       Windows it is compared against the exact path and args that were
+       registered. executableWillLaunchAtLogin is NOT the stricter check it
+       sounds like - Electron's own docs say it ignores `args` and is true if
+       the executable would launch "with any arguments" - and it is false here
+       even when the item is registered, so it can only ever be believed when
+       it says yes. Trusting it instead is how the checkbox silently snaps
+       back on every click. */
+    const enabled = !!settings.openAtLogin
+      || (isWindows && settings.executableWillLaunchAtLogin === true);
+    return { supported: true, enabled, reason: null };
+  }
+
   /* A read must never break the settings pane, so a platform that throws is
      reported as unsupported with the reason attached. */
   function status() {
     if (!usable) return { supported: false, enabled: false, reason: HEADLESS_REASON };
     if (!supported) return { supported: false, enabled: false, reason: UNSUPPORTED_REASON };
-    try {
-      const settings = app.getLoginItemSettings(optionsFor()) || {};
-      const mapped = !isWindows && DARWIN_STATUS[settings.status];
-      if (mapped) return { supported: true, ...mapped };
-      /* openAtLogin is the field that answers the question actually asked: on
-         Windows it is compared against the exact path and args that were
-         registered. executableWillLaunchAtLogin is NOT the stricter check it
-         sounds like - Electron's own docs say it ignores `args` and is true if
-         the executable would launch "with any arguments" - and it is false here
-         even when the item is registered, so it can only ever be believed when
-         it says yes. Trusting it instead is how the checkbox silently snaps
-         back on every click. */
-      const enabled = !!settings.openAtLogin
-        || (isWindows && settings.executableWillLaunchAtLogin === true);
-      return { supported: true, enabled, reason: null };
-    } catch (error) {
+    try { return describe(readSettings()); }
+    catch (error) {
       return { supported: false, enabled: false, reason: `Could not read the login item: ${message(error)}` };
     }
   }
@@ -104,9 +123,10 @@ function createLaunchAgent({ app, platform = process.platform, env = process.env
     if (!supported) throw new Error(UNSUPPORTED_REASON);
     const wanted = !!enabled;
     app.setLoginItemSettings({ openAtLogin: wanted, ...optionsFor() });
-    const after = status();
+    const settings = readSettings();
+    const after = describe(settings);
     if (after.enabled !== wanted) {
-      throw new Error(after.reason || (wanted
+      throw new Error(after.reason || WRITE_FAILURE[settings.status] || (wanted
         ? 'the system refused to add the login item'
         : 'the system refused to remove the login item'));
     }
