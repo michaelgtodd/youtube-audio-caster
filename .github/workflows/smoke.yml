@@ -86,8 +86,10 @@ jobs:
       # bound to an element that did not exist, window.prompt throwing, a css
       # rule that could never hide a block. Load the real UI and check it.
       - name: UI loads and works
-        shell: bash
-        run: npx electron test/renderer-smoke.js
+        run: npm run smoke:renderer
+
+      - name: Tray popup renderer works
+        run: npm run smoke:tray-popup
 
       # The smoke test proves the page loads and wires up. This proves it
       # renders the right thing: the picker, group notes, the fill spinner and

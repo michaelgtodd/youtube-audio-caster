@@ -5,7 +5,6 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs'), path = require('path');
-const minimatch = null;   // no dependency: simple prefix/glob handling below
 
 const root = path.join(__dirname, '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
@@ -14,6 +13,22 @@ const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
 function localRequires(file) {
   const src = fs.readFileSync(file, 'utf8');
   return [...src.matchAll(/require\(['"](\.\/[^'"]+)['"]\)/g)].map(m => m[1]);
+}
+
+function matchesBuildPattern(resource, pattern) {
+  if (!/[*?]/.test(pattern)
+      && (resource === pattern || resource.startsWith(pattern.replace(/\/$/, '') + '/'))) return true;
+  let expression = '^';
+  for (let index = 0; index < pattern.length; index++) {
+    const character = pattern[index];
+    if (character === '*' && pattern[index + 1] === '*') {
+      if (pattern[index + 2] === '/') { expression += '(?:.*/)?'; index += 2; }
+      else { expression += '.*'; index += 1; }
+    } else if (character === '*') expression += '[^/]*';
+    else if (character === '?') expression += '[^/]';
+    else expression += character.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(expression + '$').test(resource);
 }
 
 test('every locally required module exists on disk', () => {
@@ -50,6 +65,31 @@ test('renderer and assets are not excluded from the build', () => {
       assert.ok(!needed.startsWith(base + '/') && needed !== base,
         `${needed} is excluded from the build by "!${ex}"`);
     }
+  }
+});
+
+test('tray popup production resources exist and are not excluded from the build', () => {
+  // Arrange - these paths are loaded by BrowserWindow/HTML, not all by require().
+  const popupResources = [
+    'renderer/tray-popup.html',
+    'renderer/tray-popup.js',
+    'tray-popup-preload.js',
+    'tray-popup-position.js',
+  ];
+  const excluded = pkg.build.files.filter(file => file.startsWith('!')).map(file => file.slice(1));
+
+  // Act - resolve every production path and the exclusion that would omit it.
+  const resourceChecks = popupResources.map(resource => ({
+    resource,
+    exists: fs.existsSync(path.join(root, resource)),
+    exclusion: excluded.find(pattern => matchesBuildPattern(resource, pattern)),
+  }));
+
+  // Assert - packaging cannot silently lose any popup renderer/preload resource.
+  for (const check of resourceChecks) {
+    assert.ok(check.exists, `${check.resource} does not exist`);
+    assert.strictEqual(check.exclusion, undefined,
+      `${check.resource} is excluded from the build by "!${check.exclusion}"`);
   }
 });
 

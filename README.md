@@ -62,14 +62,16 @@ npm install
 npm start
 ```
 
-**On macOS** the app lives in your menu bar rather than the Dock. Click the speaker
-icon to show or hide the window, right-click it for a menu.
+**On macOS** the app lives in your menu bar rather than the Dock. Left- or right-click
+the speaker icon to open its menu. Use the slider for the currently selected speaker
+or group, choose **Open Window** for the full app, or choose
+**Quit (stops auto-refresh)** to exit.
 
 **On Windows** it behaves like a normal app with a taskbar button, and also puts an
-icon in the notification area. Closing the window tucks it away there rather than
-quitting, so your music keeps playing — it tells you the first time so it doesn't
-look like a crash. To actually exit, right-click the notification-area icon and
-choose Quit.
+icon in the notification area. Closing the window tucks it away there instead of
+quitting, so the app keeps running — it tells you the first time. Left- or
+right-click the icon to open the same menu, change the selected speaker or group's
+volume, or choose **Open Window**. To exit, choose **Quit (stops auto-refresh)**.
 
 ### Ready-made installers
 

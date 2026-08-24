@@ -3,14 +3,501 @@
    no test dependencies. */
 const test = require('node:test');
 const assert = require('node:assert');
+const { EventEmitter } = require('node:events');
 const os = require('os'), fs = require('fs'), path = require('path');
 
 const PL = require('../playlists.js');
 const CQ = require('../castqueue.js');
 const ID = require('../identity.js');
 const SO = require('../sonos.js');
+const { calculateTrayPopupPosition } = require('../tray-popup-position.js');
+const {
+  bindTrayActivation,
+  bindTrayPopup,
+  isTrustedTrayPopupIpc,
+} = require('../tray-popup-wiring.js');
+const {
+  VolumeWriteTimeoutError,
+  createVolumeWriteCoordinator,
+  isVolumeTargetCurrent,
+  normalizeVolume,
+} = require('../volume-write-coordinator.js');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'yac-test-'));
+const TRAY_POPUP_URL = 'http://127.0.0.1:4321/tray-popup.html';
+
+const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, reject, resolve };
+}
+
+function createManualTimers() {
+  const timers = [];
+  return {
+    cancelTimeout(timer) { timer.cancelled = true; },
+    expireNext() {
+      const timer = timers.find(candidate => !candidate.cancelled && !candidate.fired);
+      assert.ok(timer, 'expected a pending operation timeout');
+      timer.fired = true;
+      timer.callback();
+    },
+    scheduleTimeout(callback) {
+      const timer = { callback, cancelled: false, fired: false };
+      timers.push(timer);
+      return timer;
+    },
+  };
+}
+
+function createTestVolumeCoordinator(timers = createManualTimers()) {
+  return {
+    coordinator: createVolumeWriteCoordinator({
+      operationTimeoutMs: 100,
+      scheduleTimeout: timers.scheduleTimeout,
+      cancelTimeout: timers.cancelTimeout,
+    }),
+    timers,
+  };
+}
+
+function createTrayPopupWiringFixture(isWindows = true) {
+  const webContents = new EventEmitter();
+  webContents.destroyed = false;
+  webContents.url = TRAY_POPUP_URL;
+  webContents.mainFrame = { url: TRAY_POPUP_URL };
+  webContents.isDestroyed = () => webContents.destroyed;
+  webContents.getURL = () => webContents.url;
+  webContents.setWindowOpenHandler = handler => { webContents.windowOpenHandler = handler; };
+
+  const popup = new EventEmitter();
+  popup.webContents = webContents;
+  popup.destroyed = false;
+  popup.visible = true;
+  popup.hideCount = 0;
+  popup.isDestroyed = () => popup.destroyed;
+  popup.isVisible = () => popup.visible;
+  popup.hide = () => { popup.hideCount += 1; popup.visible = false; };
+
+  const tray = new EventEmitter();
+  tray.destroyed = false;
+  tray.focusCount = 0;
+  tray.isDestroyed = () => tray.destroyed;
+  tray.focus = () => { tray.focusCount += 1; };
+
+  const lifecycle = { blurred: 0, closed: 0 };
+  bindTrayPopup({
+    popup,
+    isWindows,
+    getTray: () => tray,
+    onBlurred: () => { lifecycle.blurred += 1; },
+    onClosed: () => { lifecycle.closed += 1; },
+  });
+  return { lifecycle, popup, tray, webContents };
+}
+
+function trayPopupIpcRequest(fixture, overrides = {}) {
+  return {
+    event: {
+      sender: fixture.webContents,
+      senderFrame: fixture.webContents.mainFrame,
+    },
+    args: [],
+    popup: fixture.popup,
+    getExpectedUrl: () => TRAY_POPUP_URL,
+    ...overrides,
+  };
+}
+
+test('volume target guard allows omission or an exact current target only', () => {
+  assert.strictEqual(isVolumeTargetCurrent(undefined, 'cast:group-a'), true);
+  assert.strictEqual(isVolumeTargetCurrent('cast:group-a', 'cast:group-a'), true);
+  assert.strictEqual(isVolumeTargetCurrent('cast:group-b', 'cast:group-a'), false);
+  assert.strictEqual(isVolumeTargetCurrent(null, 'cast:group-a'), false);
+});
+
+test('volume normalization rejects non-finite values and clamps finite bounds', () => {
+  assert.strictEqual(normalizeVolume(-0.25), 0);
+  assert.strictEqual(normalizeVolume(0.375), 0.375);
+  assert.strictEqual(normalizeVolume(1.25), 1);
+  assert.throws(() => normalizeVolume(NaN), /finite number/);
+  assert.throws(() => normalizeVolume(Infinity), /finite number/);
+  assert.throws(() => normalizeVolume(null), /finite number/);
+});
+
+test('volume coordinator coalesces queued writes to the latest value', async () => {
+  const { coordinator } = createTestVolumeCoordinator();
+  const firstOperation = deferred();
+  const latestOperation = deferred();
+  const calls = [];
+  const first = coordinator.submit({
+    target: 'cast:group-a', value: 0.1,
+    write: value => { calls.push(value); return firstOperation.promise; },
+  });
+  await nextTurn();
+
+  const superseded = coordinator.submit({
+    target: 'cast:group-a', value: 0.4,
+    write: value => { calls.push(value); return Promise.resolve(); },
+  });
+  const latest = coordinator.submit({
+    target: 'cast:group-a', value: 0.9,
+    write: value => { calls.push(value); return latestOperation.promise; },
+  });
+
+  assert.deepStrictEqual(await superseded, { outcome: 'superseded', value: 0.4 });
+  assert.deepStrictEqual(calls, [0.1]);
+  firstOperation.resolve();
+  assert.deepStrictEqual(await first, { outcome: 'applied', value: 0.1 });
+  await nextTurn();
+  assert.deepStrictEqual(calls, [0.1, 0.9]);
+  latestOperation.resolve();
+  assert.deepStrictEqual(await latest, { outcome: 'applied', value: 0.9 });
+});
+
+test('volume coordinator releases a target after its bounded timeout', async () => {
+  const { coordinator, timers } = createTestVolumeCoordinator();
+  const timedOutOperation = deferred();
+  const latestOperation = deferred();
+  const calls = [];
+  const timedOut = coordinator.submit({
+    target: 'cast:group-a', value: 0.2,
+    write: value => { calls.push(value); return timedOutOperation.promise; },
+  });
+  const timedOutAssertion = assert.rejects(timedOut, VolumeWriteTimeoutError);
+  const latest = coordinator.submit({
+    target: 'cast:group-a', value: 0.8,
+    write: value => { calls.push(value); return latestOperation.promise; },
+  });
+  await nextTurn();
+
+  timers.expireNext();
+  await timedOutAssertion;
+  await nextTurn();
+  assert.deepStrictEqual(calls, [0.2, 0.8]);
+  latestOperation.resolve();
+  await latest;
+  timedOutOperation.reject(new Error('late stale rejection'));
+  await nextTurn();
+});
+
+test('volume coordinator reapplies the latest value after a late stale success', async () => {
+  const { coordinator, timers } = createTestVolumeCoordinator();
+  const staleOperation = deferred();
+  const latestOperation = deferred();
+  const repairOperation = deferred();
+  const latestAttempts = [latestOperation, repairOperation];
+  const calls = [];
+  const stale = coordinator.submit({
+    target: 'cast:group-a', value: 0.15,
+    write: value => { calls.push(value); return staleOperation.promise; },
+  });
+  const staleAssertion = assert.rejects(stale, VolumeWriteTimeoutError);
+  const latest = coordinator.submit({
+    target: 'cast:group-a', value: 0.95,
+    write: value => { calls.push(value); return latestAttempts.shift().promise; },
+  });
+  await nextTurn();
+  timers.expireNext();
+  await staleAssertion;
+  await nextTurn();
+
+  latestOperation.resolve();
+  await latest;
+  staleOperation.resolve();
+  await nextTurn();
+  assert.deepStrictEqual(calls, [0.15, 0.95, 0.95]);
+  repairOperation.reject(new Error('bounded repair rejection'));
+  await nextTurn();
+  assert.deepStrictEqual(calls, [0.15, 0.95, 0.95]);
+});
+
+test('volume coordinator continues after a rejected device operation', async () => {
+  const { coordinator } = createTestVolumeCoordinator();
+  const rejectedOperation = deferred();
+  const latestOperation = deferred();
+  const calls = [];
+  const rejected = coordinator.submit({
+    target: 'sonos:group-a', value: 0.3,
+    write: value => { calls.push(value); return rejectedOperation.promise; },
+  });
+  const rejectionAssertion = assert.rejects(rejected, /speaker rejected volume/);
+  const latest = coordinator.submit({
+    target: 'sonos:group-a', value: 0.7,
+    write: value => { calls.push(value); return latestOperation.promise; },
+  });
+  await nextTurn();
+
+  rejectedOperation.reject(new Error('speaker rejected volume'));
+  await rejectionAssertion;
+  await nextTurn();
+  assert.deepStrictEqual(calls, [0.3, 0.7]);
+  latestOperation.resolve();
+  await latest;
+});
+
+test('volume coordinator isolates in-flight work by target', async () => {
+  const { coordinator } = createTestVolumeCoordinator();
+  const firstAOperation = deferred();
+  const latestAOperation = deferred();
+  const operationB = deferred();
+  const calls = [];
+  const firstA = coordinator.submit({
+    target: 'cast:group-a', value: 0.1,
+    write: value => { calls.push(['cast:group-a', value]); return firstAOperation.promise; },
+  });
+  const latestA = coordinator.submit({
+    target: 'cast:group-a', value: 0.6,
+    write: value => { calls.push(['cast:group-a', value]); return latestAOperation.promise; },
+  });
+  const writeB = coordinator.submit({
+    target: 'cast:group-b', value: 0.8,
+    write: value => { calls.push(['cast:group-b', value]); return operationB.promise; },
+  });
+  await nextTurn();
+
+  assert.deepStrictEqual(calls, [['cast:group-a', 0.1], ['cast:group-b', 0.8]]);
+  operationB.resolve();
+  await writeB;
+  firstAOperation.resolve();
+  await firstA;
+  await nextTurn();
+  assert.deepStrictEqual(calls, [
+    ['cast:group-a', 0.1],
+    ['cast:group-b', 0.8],
+    ['cast:group-a', 0.6],
+  ]);
+  latestAOperation.resolve();
+  await latestA;
+});
+
+test('tray popup wiring binds both left and right tray activation', () => {
+  const tray = new EventEmitter();
+  const activations = [];
+  bindTrayActivation(tray, event => activations.push(event.button));
+
+  tray.emit('click', { button: 'left' });
+  tray.emit('right-click', { button: 'right' });
+
+  assert.deepStrictEqual(activations, ['left', 'right']);
+});
+
+test('tray popup wiring denies navigation and new windows', () => {
+  const { webContents } = createTrayPopupWiringFixture();
+  const prevented = [];
+
+  webContents.emit('will-navigate', { preventDefault: () => prevented.push('main') });
+  webContents.emit('will-frame-navigate', { preventDefault: () => prevented.push('frame') });
+
+  assert.deepStrictEqual(prevented, ['main', 'frame']);
+  assert.deepStrictEqual(webContents.windowOpenHandler(), { action: 'deny' });
+});
+
+test('tray popup blur records the lifecycle event and hides a visible popup', () => {
+  const { lifecycle, popup } = createTrayPopupWiringFixture();
+
+  popup.emit('blur');
+
+  assert.deepStrictEqual({ blurred: lifecycle.blurred, hidden: popup.hideCount },
+    { blurred: 1, hidden: 1 });
+});
+
+test('tray popup blur ignores hidden or destroyed popups', () => {
+  const hidden = createTrayPopupWiringFixture();
+  hidden.popup.visible = false;
+  hidden.popup.emit('blur');
+  const destroyed = createTrayPopupWiringFixture();
+  destroyed.popup.destroyed = true;
+  destroyed.popup.emit('blur');
+
+  assert.deepStrictEqual([
+    hidden.lifecycle.blurred, hidden.popup.hideCount,
+    destroyed.lifecycle.blurred, destroyed.popup.hideCount,
+  ], [0, 0, 0, 0]);
+});
+
+test('tray popup Escape hides the popup and returns focus to the Windows tray', () => {
+  const { popup, tray, webContents } = createTrayPopupWiringFixture(true);
+  let prevented = false;
+
+  webContents.emit('before-input-event', { preventDefault: () => { prevented = true; } },
+    { type: 'keyDown', key: 'Escape' });
+
+  assert.deepStrictEqual({ prevented, hidden: popup.hideCount, trayFocused: tray.focusCount },
+    { prevented: true, hidden: 1, trayFocused: 1 });
+});
+
+test('tray popup ignores non-Escape input and does not focus the tray on macOS', () => {
+  const mac = createTrayPopupWiringFixture(false);
+  mac.webContents.emit('before-input-event', { preventDefault: () => assert.fail('unexpected preventDefault') },
+    { type: 'keyDown', key: 'Enter' });
+  mac.webContents.emit('before-input-event', { preventDefault() {} },
+    { type: 'keyDown', key: 'Escape' });
+
+  assert.deepStrictEqual({ hidden: mac.popup.hideCount, trayFocused: mac.tray.focusCount },
+    { hidden: 1, trayFocused: 0 });
+});
+
+test('tray popup closed event invokes the production close callback', () => {
+  const { lifecycle, popup } = createTrayPopupWiringFixture();
+
+  popup.emit('closed');
+
+  assert.strictEqual(lifecycle.closed, 1);
+});
+
+test('tray popup IPC trusts the exact live contents, main frame, URL, and no arguments', () => {
+  const fixture = createTrayPopupWiringFixture();
+
+  assert.strictEqual(isTrustedTrayPopupIpc(trayPopupIpcRequest(fixture)), true);
+});
+
+test('tray popup IPC rejects a different sender', () => {
+  const fixture = createTrayPopupWiringFixture();
+  const event = { sender: {}, senderFrame: fixture.webContents.mainFrame };
+
+  assert.strictEqual(isTrustedTrayPopupIpc(trayPopupIpcRequest(fixture, { event })), false);
+});
+
+test('tray popup IPC rejects a different frame even when its URL matches', () => {
+  const fixture = createTrayPopupWiringFixture();
+  const event = { sender: fixture.webContents, senderFrame: { url: TRAY_POPUP_URL } };
+
+  assert.strictEqual(isTrustedTrayPopupIpc(trayPopupIpcRequest(fixture, { event })), false);
+});
+
+test('tray popup IPC rejects mismatched frame and webContents URLs', async t => {
+  await t.test('main frame URL', () => {
+    const fixture = createTrayPopupWiringFixture();
+    fixture.webContents.mainFrame.url = `${TRAY_POPUP_URL}?unexpected`;
+    assert.strictEqual(isTrustedTrayPopupIpc(trayPopupIpcRequest(fixture)), false);
+  });
+  await t.test('webContents URL', () => {
+    const fixture = createTrayPopupWiringFixture();
+    fixture.webContents.url = 'http://127.0.0.1:4321/';
+    assert.strictEqual(isTrustedTrayPopupIpc(trayPopupIpcRequest(fixture)), false);
+  });
+});
+
+test('tray popup IPC rejects arguments', () => {
+  const fixture = createTrayPopupWiringFixture();
+
+  assert.strictEqual(isTrustedTrayPopupIpc(trayPopupIpcRequest(fixture, { args: ['unexpected'] })), false);
+  assert.strictEqual(isTrustedTrayPopupIpc(trayPopupIpcRequest(fixture, { args: undefined })), false);
+});
+
+test('tray popup IPC rejects destroyed popup resources', () => {
+  const destroyedPopup = createTrayPopupWiringFixture();
+  destroyedPopup.popup.destroyed = true;
+  const destroyedContents = createTrayPopupWiringFixture();
+  destroyedContents.webContents.destroyed = true;
+
+  assert.strictEqual(isTrustedTrayPopupIpc(trayPopupIpcRequest(destroyedPopup)), false);
+  assert.strictEqual(isTrustedTrayPopupIpc(trayPopupIpcRequest(destroyedContents)), false);
+});
+
+test('tray popup opens below a top reserved edge', () => {
+  const position = calculateTrayPopupPosition({
+    trayBounds: { x: 700, y: 0, width: 24, height: 24 },
+    displayBounds: { x: 0, y: 0, width: 1440, height: 900 },
+    workArea: { x: 0, y: 24, width: 1440, height: 876 },
+    popupSize: { width: 300, height: 220 },
+  });
+
+  assert.deepStrictEqual(position, { x: 562, y: 24 });
+});
+
+test('tray popup opens above a bottom reserved edge on a negative-coordinate display', () => {
+  const position = calculateTrayPopupPosition({
+    trayBounds: { x: -700, y: 984, width: 32, height: 40 },
+    displayBounds: { x: -1280, y: 0, width: 1280, height: 1024 },
+    workArea: { x: -1280, y: 0, width: 1280, height: 984 },
+    popupSize: { width: 300, height: 220 },
+  });
+
+  assert.deepStrictEqual(position, { x: -834, y: 764 });
+});
+
+test('tray popup opens right of a left reserved edge', () => {
+  const position = calculateTrayPopupPosition({
+    trayBounds: { x: 0, y: 400, width: 48, height: 32 },
+    displayBounds: { x: 0, y: 0, width: 1200, height: 900 },
+    workArea: { x: 48, y: 0, width: 1152, height: 900 },
+    popupSize: { width: 280, height: 200 },
+  });
+
+  assert.deepStrictEqual(position, { x: 48, y: 316 });
+});
+
+test('tray popup opens left of a right reserved edge on an offset display', () => {
+  const position = calculateTrayPopupPosition({
+    trayBounds: { x: 3072, y: 100, width: 48, height: 32 },
+    displayBounds: { x: 1920, y: -200, width: 1200, height: 900 },
+    workArea: { x: 1920, y: -200, width: 1152, height: 900 },
+    popupSize: { width: 280, height: 200 },
+  });
+
+  assert.deepStrictEqual(position, { x: 2792, y: 16 });
+});
+
+test('tray popup uses the reserved edge nearest the tray when two edges are reserved', () => {
+  const position = calculateTrayPopupPosition({
+    trayBounds: { x: 700, y: 0, width: 24, height: 24 },
+    displayBounds: { x: 0, y: 0, width: 1440, height: 900 },
+    workArea: { x: 0, y: 24, width: 1440, height: 826 },
+    popupSize: { width: 300, height: 220 },
+  });
+
+  assert.deepStrictEqual(position, { x: 562, y: 24 });
+});
+
+test('tray popup clamps a top-left corner tray to the secondary display work area', () => {
+  const position = calculateTrayPopupPosition({
+    trayBounds: { x: -1600, y: -100, width: 24, height: 30 },
+    displayBounds: { x: -1600, y: -100, width: 1600, height: 1000 },
+    workArea: { x: -1600, y: -70, width: 1600, height: 970 },
+    popupSize: { width: 360, height: 240 },
+  });
+
+  assert.deepStrictEqual(position, { x: -1600, y: -70 });
+});
+
+test('tray popup clamps a bottom-right corner tray to the complete work area', () => {
+  const position = calculateTrayPopupPosition({
+    trayBounds: { x: 1880, y: 1040, width: 40, height: 40 },
+    displayBounds: { x: 0, y: 0, width: 1920, height: 1080 },
+    workArea: { x: 0, y: 0, width: 1920, height: 1040 },
+    popupSize: { width: 360, height: 240 },
+  });
+
+  assert.deepStrictEqual(position, { x: 1560, y: 800 });
+});
+
+test('tray popup returns integer coordinates when nearly as large as the work area', () => {
+  const position = calculateTrayPopupPosition({
+    trayBounds: { x: 590, y: 50, width: 20, height: 24 },
+    displayBounds: { x: 100, y: 50, width: 1000, height: 800 },
+    workArea: { x: 100, y: 74, width: 1000, height: 776 },
+    popupSize: { width: 999, height: 775 },
+  });
+
+  assert.deepStrictEqual(position, { x: 101, y: 74 });
+});
+
+test('tray popup rejects dimensions that cannot fit inside the work area', () => {
+  assert.throws(() => calculateTrayPopupPosition({
+    trayBounds: { x: 0, y: 0, width: 24, height: 24 },
+    displayBounds: { x: 0, y: 0, width: 800, height: 600 },
+    workArea: { x: 0, y: 24, width: 800, height: 576 },
+    popupSize: { width: 801, height: 200 },
+  }), /must fit completely inside workArea/);
+});
 
 test('playlists: create, add, dedupe by video id', () => {
   PL.init(tmp());

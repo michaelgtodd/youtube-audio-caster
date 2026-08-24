@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>YouTube Audio Caster</title>
+<style>
+:root{
+  color-scheme:light;
+  --surface:#f7f7f8; --ink:#171719; --muted:#59595f;
+  --line:rgba(60,60,67,.18); --selection:#0868d7; --selection-ink:#fff;
+  --focus:#0868d7; --ok:#248a3d; --buffering:#946200; --error:#b42318;
+}
+@media (prefers-color-scheme:dark){:root{
+  color-scheme:dark;
+  --surface:#232325; --ink:#f2f2f4; --muted:#b8b8be;
+  --line:rgba(235,235,245,.2); --selection:#0a6ce0; --selection-ink:#fff;
+  --focus:#71a7ff; --ok:#48b45f; --buffering:#e0a43a; --error:#ff766d;
+}}
+*{box-sizing:border-box}
+html,body{margin:0;min-width:0;width:100%;height:100%;overflow:hidden;background:transparent;color:var(--ink)}
+body{font:13px/1.3 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif;
+  -webkit-font-smoothing:antialiased}
+button,input{font:inherit}
+.popup{width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;background:transparent;
+  border:1px solid var(--line);border-radius:9px}
+:root[data-native-surface=solid] .popup{background:var(--surface)}
+.playback{min-width:0;padding:8px 11px 7px}
+.playback-primary{position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto;
+  align-items:center;gap:8px;min-width:0;padding-left:14px}
+.now-playing{margin:0;min-width:0;color:var(--ink);font-size:13px;font-weight:600;line-height:18px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.state{min-width:0;max-width:76px;color:var(--muted);font-size:11.5px;line-height:18px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.state::before{content:"";position:absolute;left:1px;top:50%;width:7px;height:7px;
+  border-radius:50%;background:var(--muted);transform:translateY(-50%)}
+.state[data-state=playing]::before{background:var(--ok)}
+.state[data-state=buffering]::before{background:var(--buffering)}
+.state[data-state=error]::before{background:var(--error)}
+.device{display:flex;align-items:baseline;gap:5px;min-width:0;margin:3px 0 0;padding-left:14px;
+  color:var(--muted);font-size:11.5px;line-height:17px;white-space:nowrap}
+.device-label{flex:none;color:var(--muted)}
+.device-label::after{content:":"}
+.device-name{min-width:0;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.separator{height:1px;margin:0 9px;background:var(--line)}
+.volume-control{min-width:0;padding:6px 11px}
+.volume-row{display:flex;align-items:center;gap:7px;min-width:0;height:30px}
+.volume-label{display:inline-flex;align-items:center;gap:4px;flex:none;color:var(--ink);font-size:12px}
+.volume-label svg{width:13px;height:13px;flex:none;color:var(--muted)}
+input[type=range]{display:block;flex:1 1 auto;min-width:0;width:auto;height:26px;margin:0;
+  accent-color:var(--selection);cursor:pointer}
+input[type=range]:disabled{opacity:.43;cursor:default}
+.volume-value{flex:none;width:34px;color:var(--ink);font-size:12px;font-variant-numeric:tabular-nums;
+  text-align:right}
+.control-status{height:16px;margin:1px 0 0;overflow:hidden;color:var(--muted);font-size:11px;
+  line-height:16px;text-overflow:ellipsis;white-space:nowrap}
+.control-status.error{color:var(--error)}
+.actions{padding:3px 0}
+.menu-item{display:block;width:100%;height:30px;border:0;border-radius:0;padding:0 12px;
+  background:transparent;color:var(--ink);font-size:13px;font-weight:400;line-height:30px;
+  text-align:left;cursor:default;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.menu-item:hover:not(:disabled),.menu-item:focus-visible{outline:0;background:var(--selection);
+  color:var(--selection-ink)}
+.menu-item:disabled{color:var(--muted);opacity:.55}
+input[type=range]:focus-visible{outline:2px solid var(--focus);outline-offset:1px;border-radius:3px}
+@media (forced-colors:active){
+  .popup{background:Canvas;border-color:CanvasText;-webkit-backdrop-filter:none;backdrop-filter:none}
+  .separator{background:GrayText}
+  .state::before{background:CanvasText!important}
+  .menu-item:hover:not(:disabled),.menu-item:focus-visible{background:Highlight;color:HighlightText}
+  input[type=range]{accent-color:Highlight}
+}
+</style>
+</head>
+<body>
+<main class="popup" aria-label="Playback and application controls">
+  <section class="playback" aria-label="Playback status">
+    <div class="playback-primary">
+      <p class="now-playing" id="now-playing" aria-live="polite">Loading playback status…</p>
+      <span class="state" id="playback-state" data-state="loading" aria-live="polite">Checking</span>
+    </div>
+    <p class="device">
+      <span class="device-label">Speaker / group</span>
+      <span class="device-name" id="device-name">Checking…</span>
+    </p>
+  </section>
+
+  <div class="separator" role="separator"></div>
+
+  <section class="volume-control" aria-labelledby="volume-label">
+    <div class="volume-row">
+      <label class="volume-label" id="volume-label" for="volume">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M2.25 6.25h2.1L7 4.1v7.8L4.35 9.75h-2.1z"></path>
+          <path d="M9.45 5.6a3.25 3.25 0 0 1 0 4.8M11.35 3.7a5.8 5.8 0 0 1 0 8.6"></path>
+        </svg>
+        <span>Volume</span>
+      </label>
+      <input id="volume" type="range" min="0" max="100" step="1" value="0"
+             aria-describedby="control-status" aria-valuetext="Unavailable" disabled>
+      <output class="volume-value" id="volume-value" for="volume">—</output>
+    </div>
+    <p class="control-status" id="control-status" role="status" aria-live="polite">Checking speaker status…</p>
+  </section>
+
+  <div class="separator" role="separator"></div>
+
+  <footer class="actions" aria-label="Application">
+    <button class="menu-item" type="button" id="open-window">Open Window</button>
+    <button class="menu-item" type="button" id="quit">Quit (stops auto-refresh)</button>
+  </footer>
+</main>
+<script src="tray-popup.js" defer></script>
+</body>
+</html>

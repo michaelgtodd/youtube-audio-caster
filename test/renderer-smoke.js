@@ -19,6 +19,7 @@ const freePort = () => new Promise(r => {
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
 app.whenReady().then(async () => {
+  if (process.platform === 'darwin' && app.dock) app.dock.hide();
   const port = await freePort();
   /* @svrooij/sonos listens for UPnP events on a FIXED port (6329) unless told
      otherwise. Running this while the real app is up means a second bind of the
@@ -27,7 +28,10 @@ app.whenReady().then(async () => {
   process.env.SONOS_LISTENER_PORT = String(await freePort());
   await require('../server.js').start(port, '127.0.0.1');
 
-  const win = new BrowserWindow({ show: false, width: 1200, height: 900,
+  /* Keep validation entirely off the desktop even if a future edit
+     accidentally shows this window. */
+  const win = new BrowserWindow({ show: false, x: -10000, y: -10000,
+    width: 1200, height: 900, opacity: 0, skipTaskbar: true,
     webPreferences: { contextIsolation: true } });
 
   /* Electron prints its own security advice about CSP and unsafe-eval on any

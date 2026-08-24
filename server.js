@@ -16,6 +16,12 @@ const GRP = require('./castgroups.js');
 const SO = require('./sonos.js');
 const WD = require('./watchdog.js');
 const VER = require('./version.js');
+const {
+  DEFAULT_OPERATION_TIMEOUT_MS,
+  createVolumeWriteCoordinator,
+  isVolumeTargetCurrent,
+  normalizeVolume,
+} = require('./volume-write-coordinator.js');
 const { videoIdOf, isPlaylistUrl, cdnToken, expiryOf, remember, recall } = ID;
 
 const DMR_APP_ID = GRP.SOLO_APP;   // 'CC1AD845' - defined once, next to the group app ids
@@ -369,6 +375,22 @@ const pconnect = (host, port) => new Promise((res, rej) => {
 });
 const p = (obj, fn, ...a) => new Promise((res, rej) =>
   obj[fn](...a, (e, r) => e ? rej(e) : res(r)));
+
+const volumeWrites = createVolumeWriteCoordinator({
+  operationTimeoutMs: DEFAULT_OPERATION_TIMEOUT_MS,
+});
+
+function snapshotVolumeWrite() {
+  const target = S.device;
+  if (S.protocol === 'sonos') {
+    const control = S.sonosGroup;
+    if (!target || !control) throw new Error('volume control is unavailable');
+    return { target, write: level => control.SetGroupVolume(Math.round(level * 100)) };
+  }
+  const control = S.client;
+  if (!target || !control) throw new Error('volume control is unavailable');
+  return { target, write: level => p(control, 'setVolume', { level }) };
+}
 
 async function teardown() {
   try { S.client && S.client.close(); } catch {}
@@ -1190,7 +1212,7 @@ app.get('/api/status', async (req, res) => {
 });
 
 app.post('/api/control', async (req, res) => {
-  const { action, value } = req.body || {};
+  const { action, target, value } = req.body || {};
   if (!connected() && action !== 'refresh') return res.status(400).json({ error: 'not connected' });
   try {
     if (action === 'play') {
@@ -1211,9 +1233,14 @@ app.post('/api/control', async (req, res) => {
       if (S.protocol === 'sonos') await S.sonos.seek(Number(value) || 0);
       else await p(S.player, 'seek', Number(value) || 0);
     } else if (action === 'volume') {
-      const level = Math.max(0, Math.min(1, Number(value)));
-      if (S.protocol === 'sonos') await S.sonosGroup.SetGroupVolume(Math.round(level * 100));
-      else await p(S.client, 'setVolume', { level });
+      if (!isVolumeTargetCurrent(target, S.device)) {
+        return res.status(409).json({ error: 'selected speaker or group changed' });
+      }
+      let level;
+      try { level = normalizeVolume(value); }
+      catch { return res.status(400).json({ error: 'volume must be a finite number' }); }
+      const operation = snapshotVolumeWrite();
+      await volumeWrites.submit({ ...operation, value: level });
     }
     else if (action === 'refresh') await reissue('manual');
     else return res.status(400).json({ error: 'unknown action ' + action });
