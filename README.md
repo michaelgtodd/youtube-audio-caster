@@ -73,6 +73,21 @@ quitting, so the app keeps running — it tells you the first time. Left- or
 right-click the icon to open the same menu, change the selected speaker or group's
 volume, or choose **Open Window**. To exit, choose **Quit (stops auto-refresh)**.
 
+### Starting it automatically
+
+**Settings** (top right of the window) has **Start at login**: the app opens by
+itself when you sign in, so a speaker is always ready without going looking for
+it. It's off until you turn it on.
+
+Underneath is **Start quietly in the background** — on by default, and it means a
+login start puts the icon in the menu bar (macOS) or notification area (Windows)
+without opening a window. Opening the app yourself still works normally. Turn it
+off if you'd rather see the window every time you sign in.
+
+Whether the app starts at login is remembered by the operating system, not by the
+app, so removing it in **System Settings → General → Login Items** (macOS) or
+**Task Manager → Startup apps** (Windows) works too, and the checkbox will agree.
+
 ### Ready-made installers
 
 Every tagged version is built automatically for both platforms — grab a `.dmg`

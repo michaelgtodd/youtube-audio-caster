@@ -42,7 +42,7 @@ jobs:
             if [ "$i" = "30" ]; then echo "SERVER NEVER ANSWERED"; cat server.log; exit 1; fi
           done
           echo "--- every endpoint must answer with sane json ---"
-          for EP in /api/devices /api/playlists /api/queue /api/status /api/jobs /api/errors; do
+          for EP in /api/devices /api/playlists /api/queue /api/status /api/jobs /api/errors /api/settings; do
             BODY=$(curl -s --max-time 25 "http://127.0.0.1:8931$EP")
             echo "$BODY" | node -e "
               let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
@@ -81,6 +81,45 @@ jobs:
               exit 1; fi
           done
           echo "--- electron log ---"; cat electron.log
+
+      # Registering a login item is the one thing that cannot be proved off the
+      # real OS: it writes to SMAppService on macOS and to the registry on
+      # Windows, and a unit test can only check which options were passed. The
+      # app from the previous step is still running, so drive it through its own
+      # API and then ask the operating system whether it agrees.
+      - name: Start-at-login registers with the OS and unregisters again
+        shell: bash
+        run: |
+          PORT=$(grep -oE '127\.0\.0\.1:[0-9]+' electron.log | head -1 | cut -d: -f2)
+          [ -n "$PORT" ] || { echo "no port in electron.log"; exit 1; }
+          api() { curl -s --max-time 10 "http://127.0.0.1:$PORT/api/settings" "$@"; }
+          set_login() { api -X POST -H 'Content-Type: application/json' -d "{\"launch_at_login\":$1}"; }
+          RUN_KEY='HKCU\Software\Microsoft\Windows\CurrentVersion\Run'
+
+          echo "--- it must report itself supported here ---"
+          BEFORE=$(api)
+          echo "$BEFORE"
+          echo "$BEFORE" | grep -q '"supported":true' \
+            || { echo "start at login reported UNSUPPORTED on $RUNNER_OS"; exit 1; }
+
+          echo "--- turn it on ---"
+          set_login true | tee on.json
+          grep -q '"enabled":true' on.json || { echo "the OS did not take the login item"; exit 1; }
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            reg query "$RUN_KEY" //s | grep -i "opened-at-login" \
+              || { echo "nothing was written to the Run key"; reg query "$RUN_KEY"; exit 1; }
+            echo "  registry entry present"
+          fi
+
+          echo "--- and off again, so the runner is left as it was found ---"
+          set_login false | tee off.json
+          grep -q '"enabled":false' off.json || { echo "the login item survived being turned off"; exit 1; }
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            if reg query "$RUN_KEY" //s 2>/dev/null | grep -qi "opened-at-login"; then
+              echo "the Run key entry was NOT removed"; reg query "$RUN_KEY"; exit 1; fi
+            echo "  registry entry removed"
+          fi
+          echo "start at login round-tripped through the real OS"
 
       # The failures that actually reached users were renderer-side: a handler
       # bound to an element that did not exist, window.prompt throwing, a css

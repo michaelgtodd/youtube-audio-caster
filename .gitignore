@@ -19,6 +19,7 @@ sessions.json.tmp
 playlists.json
 playlists.json.tmp
 settings.json
+settings.json.tmp
 .DS_Store
 
 # stamped at pack time by scripts/build-info.js

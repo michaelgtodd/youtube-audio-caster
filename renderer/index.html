@@ -20,6 +20,20 @@ body{margin:0;background:var(--bg);color:var(--ink);
 h1{font-size:19px;margin:0 0 2px;letter-spacing:-.2px}
 .sub{color:var(--muted);font-size:13px;margin-bottom:20px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+.head{display:flex;align-items:flex-start;gap:12px}
+.headtext{flex:1;min-width:0}
+/* A setting is a checkbox with its explanation attached, not a bare label: what
+   "start quietly" does is not guessable from three words, and the sentence
+   under it is the difference between a toggle people trust and one they leave
+   alone. The whole block is the <label>, so the text is a hit target too. */
+.set{display:flex;gap:10px;align-items:flex-start;padding:8px 0;cursor:pointer}
+.set+.set{border-top:1px solid var(--line)}
+.set input{margin:2px 0 0;flex:none;cursor:pointer}
+.set b{font-weight:560;font-size:14px}
+.set .meta{display:block;margin-top:2px}
+.set input:disabled,.set input:disabled~span{cursor:default;opacity:.55}
+/* Indented because it only means anything while the setting above it is on. */
+.set.dependent{padding-left:26px}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 input[type=text],select{
   background:var(--bg);color:var(--ink);border:1px solid var(--line);
@@ -163,9 +177,34 @@ button.mini.done{background:var(--ok)}
 <body>
 <button class="ghost mini" id="exitexpand" title="Exit theater mode (Esc)">✕ Exit</button>
 <div class="wrap">
-  <h1>YouTube Audio Caster</h1>
-  <div class="sub">Native buffered audio to Cast and Sonos speakers &middot; video stays local &amp; synced
-    <span id="ver" class="ver hide" title=""></span></div>
+  <div class="head">
+    <div class="headtext">
+      <h1>YouTube Audio Caster</h1>
+      <div class="sub">Native buffered audio to Cast and Sonos speakers &middot; video stays local &amp; synced
+        <span id="ver" class="ver hide" title=""></span></div>
+    </div>
+    <button class="ghost mini tog" id="setbtn" title="Settings"
+            aria-expanded="false" aria-controls="setcard">⚙ Settings</button>
+  </div>
+
+  <div class="card hide" id="setcard">
+    <label class="set" for="setlogin">
+      <input type="checkbox" id="setlogin" disabled>
+      <span>
+        <b>Start at login</b>
+        <span class="meta" id="setloginwhy">Open YouTube Audio Caster automatically when you sign in.</span>
+      </span>
+    </label>
+    <label class="set dependent" for="setquiet">
+      <input type="checkbox" id="setquiet" disabled>
+      <span>
+        <b>Start quietly in the background</b>
+        <span class="meta">Only the menu bar icon appears at login. Opening the app yourself
+          still shows the window.</span>
+      </span>
+    </label>
+    <div id="setmsg"></div>
+  </div>
 
   <div class="card">
     <div class="row">
@@ -661,6 +700,56 @@ window.addEventListener('keydown', e=>{
   if(e.key==='Escape' && document.body.classList.contains('theater')){ setTheater(false); }
 });
 
+/* ---------------- settings ---------------- */
+/* The pane is collapsed until asked for: it is two checkboxes people set once,
+   and it should not push the thing they came here to do down the page. */
+const setmsg=(t,c)=>{ $('setmsg').innerHTML = t? `<div class="msg ${c||''}">${t}</div>`:''; };
+const LOGIN_HELP='Open YouTube Audio Caster automatically when you sign in.';
+
+/* The server re-reads the OS on every reply, so this paints what the machine
+   will actually do - including a login item removed outside the app. */
+function renderSettings(s){
+  const login=s.launch_at_login||{supported:false,enabled:false};
+  $('setlogin').checked=!!login.enabled;
+  $('setlogin').disabled=!login.supported;
+  /* A reason outranks the stock help line whether or not the platform is
+     supported: macOS can register the item and still need approving, and that
+     sentence is the only thing that tells anyone why nothing happens at login. */
+  $('setloginwhy').textContent=login.reason||LOGIN_HELP;
+  /* Quiet start cannot do anything until something starts the app for you, so
+     it is disabled rather than left looking as though it takes effect. */
+  $('setquiet').checked=!!s.start_quietly;
+  $('setquiet').disabled=!(login.supported&&login.enabled);
+}
+
+async function loadSettings(){
+  try{
+    const s=await api('/api/settings');
+    setmsg('');                       // a read that worked clears the last failure
+    renderSettings(s);
+  }
+  catch(e){ setmsg('could not read settings: '+e.message,'err'); }
+}
+
+/* Put the checkbox back where the server says it is on failure: a box that
+   stays where the user clicked it, having changed nothing, is a lie. */
+async function saveSetting(key,value){
+  setmsg('');
+  try{
+    renderSettings(await api('/api/settings',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({[key]:value})}));
+  }catch(e){ setmsg(e.message,'err'); await loadSettings(); }
+}
+$('setlogin').onchange=e=>saveSetting('launch_at_login',e.target.checked);
+$('setquiet').onchange=e=>saveSetting('start_quietly',e.target.checked);
+
+$('setbtn').onclick=()=>{
+  const open=$('setcard').classList.toggle('hide')===false;
+  $('setbtn').classList.toggle('on',open);
+  $('setbtn').setAttribute('aria-expanded',String(open));
+  if(open) loadSettings();          // re-read: it can change outside the app
+};
+
 /* ---------------- playlists ---------------- */
 let PLS=[], CURPL=null, DRAGFROM=null;
 const plmsg=(t,c)=>{ $('plmsg').innerHTML = t? `<div class="msg ${c||''}">${t}</div>`:''; };
@@ -1084,6 +1173,6 @@ async function tick(){
   } catch (e) { /* an old server without /api/version: just leave it hidden */ }
 })();
 
-loadDevices(false); loadPlaylists(); tick();
+loadDevices(false); loadPlaylists(); loadSettings(); tick();
 </script>
 </body></html>

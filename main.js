@@ -51,6 +51,8 @@ process.env.CASTAUDIO_DATA = app.getPath('userData');
 const binDir = app.isPackaged ? path.join(process.resourcesPath, 'bin') : path.join(__dirname, 'bin');
 process.env.YTDLP = path.join(binDir, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 const { calculateTrayPopupPosition } = require('./tray-popup-position.js');
+const SETTINGS = require('./settings.js');
+const { createLaunchAgent, openedAtLogin } = require('./launch-at-login.js');
 const {
   bindTrayActivation,
   bindTrayPopup,
@@ -145,6 +147,21 @@ async function showWindow() {
   });
   win.on('closed', () => { win = null; });
   win.once('ready-to-show', () => win.show());
+}
+
+/* A first quiet start is indistinguishable from the app not having started at
+   all: no window, no taskbar button, just an icon most people have never had a
+   reason to look at. Point at it once - the same treatment, and the same
+   once-only flag, that closing to the tray already gets. */
+function quietHint() {
+  if (flags().quietHintShown || !Notification.isSupported()) return;
+  setFlag('quietHintShown', true);
+  new Notification({
+    title: 'YouTube Audio Caster started',
+    body: `It is running in the ${isMac ? 'menu bar' : 'notification area'}. `
+      + 'Click its icon to open the app or change this in Settings.',
+    icon: path.join(__dirname, 'assets', 'icon.png'),
+  }).show();
 }
 
 function getTrayPopupUrl() {
@@ -340,10 +357,23 @@ app.whenReady().then(async () => {
      tray is an addition rather than the only way in. */
   if (isMac && app.dock) app.dock.hide();
   if (isWin) app.setAppUserModelId('com.michaelgtodd.youtube-audio-caster');
+  SETTINGS.init(app.getPath('userData'));
+  require('./server.js').setLaunchAgent(createLaunchAgent({ app }));
   await ensureServer();
+  let trayUp = true;
   try { buildTray(); }
-  catch (e) { console.error('[tray] unavailable:', e.message); }   // not fatal
-  await showWindow();
+  catch (e) { trayUp = false; console.error('[tray] unavailable:', e.message); }   // not fatal
+  /* Started by the login item and asked to keep quiet: the tray is the entire
+     interface, and a window on every boot is not what "start at login" means
+     for an app that lives in the menu bar. The server is up either way - that
+     is the point of starting at all.
+
+     If the tray could not be built there is nothing left to click, so show the
+     window regardless rather than leave a running process with no way in. That
+     is precisely the failure smoke.yml was written for. */
+  const quietly = trayUp && openedAtLogin({ app }) && SETTINGS.load().start_quietly;
+  if (quietly) { console.log('[startup] opened at login; staying in the tray'); quietHint(); }
+  else await showWindow();
   app.on('activate', () => showWindow());
 }).catch(startupFailed);
 

@@ -10,12 +10,14 @@ const { execFile } = require('child_process');
 const { Client, DefaultMediaReceiver } = require('castv2-client');
 const { Bonjour } = require('bonjour-service');
 const PL = require('./playlists.js');
+const SET = require('./settings.js');
 const CQ = require('./castqueue.js');
 const ID = require('./identity.js');
 const GRP = require('./castgroups.js');
 const SO = require('./sonos.js');
 const WD = require('./watchdog.js');
 const VER = require('./version.js');
+const LAUNCH = require('./launch-at-login.js');
 const {
   DEFAULT_OPERATION_TIMEOUT_MS,
   createVolumeWriteCoordinator,
@@ -29,6 +31,16 @@ const YTDLP = process.env.YTDLP || path.join(__dirname, 'bin', 'yt-dlp');
 const DATA_DIR = process.env.CASTAUDIO_DATA || __dirname;
 ID.setStorePath(path.join(DATA_DIR, 'sessions.json'));
 PL.init(DATA_DIR);
+SET.init(DATA_DIR);
+
+/* Only Electron can register a login item, and this server also runs headless,
+   where there is nothing to register one with. main.js injects an agent once
+   the app is ready; without it the setting reports itself unsupported and the
+   pane says why. Same shape as ID.setStorePath and PL.init above. */
+let launchAgent = null;
+const setLaunchAgent = agent => { launchAgent = agent; };
+const launchStatus = () => (launchAgent ? launchAgent.status()
+  : { supported: false, enabled: false, reason: LAUNCH.HEADLESS_REASON });
 
 const S = {
   devices: [], client: null, player: null, device: null, host: null,
@@ -1284,6 +1296,37 @@ app.post('/api/clientlog', (req, res) => {
   res.json({ ok: true });
 });
 
+/* ---------- settings ---------- */
+/* The reply always carries the whole pane, freshly read, so a client never has
+   to merge a partial response into what it already had - and the login item is
+   re-read from the OS on the way out, which is what makes an external change
+   show up rather than the value we just wrote. */
+const settingsPayload = () => ({ ...SET.load(), launch_at_login: launchStatus() });
+const SETTABLE = ['launch_at_login', ...SET.BOOLEANS];
+
+app.get('/api/settings', (req, res) => res.json(settingsPayload()));
+
+app.post('/api/settings', (req, res) => {
+  const body = (req.body && typeof req.body === 'object') ? req.body : {};
+  const asked = SETTABLE.filter(k => Object.prototype.hasOwnProperty.call(body, k));
+  if (!asked.length) return res.status(400).json({ error: 'no known setting in the request' });
+  for (const key of asked) {
+    if (typeof body[key] !== 'boolean') return res.status(400).json({ error: `${key} must be true or false` });
+  }
+  try {
+    if (asked.includes('launch_at_login')) {
+      /* Refuse rather than pretend: a platform that cannot register a login
+         item must not answer as though the checkbox took. */
+      const state = launchStatus();
+      if (!state.supported) return res.status(409).json({ error: state.reason });
+      launchAgent.set(body.launch_at_login);
+    }
+    const prefs = asked.filter(k => k !== 'launch_at_login');
+    if (prefs.length) SET.patch(Object.fromEntries(prefs.map(k => [k, body[k]])));
+    res.json(settingsPayload());
+  } catch (e) { logErr(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
 /* ---------- playlists ---------- */
 const asyncRoute = fn => (req, res) => fn(req, res).catch(e => {
   logErr(e); res.status(500).json({ error: String(e.message || e) }); });
@@ -1495,5 +1538,5 @@ function shutdown() {
   SONOS.stop();
 }
 
-module.exports = { start, shutdown, app, S };
+module.exports = { start, shutdown, setLaunchAgent, app, S };
 if (require.main === module) start();

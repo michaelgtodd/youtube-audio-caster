@@ -919,3 +919,239 @@ test('Sonos repeat modes normalize to the existing API contract', () => {
   assert.strictEqual(SO.playModeFor('all', true), 'SHUFFLE');
   assert.strictEqual(SO.playModeFor('off', false), 'NORMAL');
 });
+
+/* ---------- settings and launch at login ---------- */
+
+const SET = require('../settings.js');
+const LAUNCH = require('../launch-at-login.js');
+
+/* A stand-in for Electron's app. Records what it was told so the exact login
+   item that would be registered can be asserted, which is the part that has to
+   differ per platform. */
+function fakeElectronApp({ isPackaged = true, appPath = 'C:\\src\\app', settings = {},
+                           throwOnGet = null, throwOnSet = null } = {}) {
+  const calls = { get: [], set: [] };
+  return {
+    calls,
+    isPackaged,
+    getAppPath: () => appPath,
+    getLoginItemSettings(options) {
+      calls.get.push(options);
+      if (throwOnGet) throw throwOnGet;
+      return settings;
+    },
+    setLoginItemSettings(options) {
+      calls.set.push(options);
+      if (throwOnSet) throw throwOnSet;
+      Object.assign(settings, options);
+    },
+  };
+}
+
+test('settings fall back to defaults for a missing, corrupt or hand-broken file', () => {
+  const dir = tmp();
+  SET.init(dir);
+  assert.deepStrictEqual(SET.load(), { start_quietly: true }, 'no file at all');
+
+  fs.writeFileSync(path.join(dir, 'settings.json'), 'not json{');
+  assert.deepStrictEqual(SET.load(), { start_quietly: true }, 'unparseable');
+
+  fs.writeFileSync(path.join(dir, 'settings.json'), '["an array"]');
+  assert.deepStrictEqual(SET.load(), { start_quietly: true }, 'not an object');
+
+  /* A string where the UI expects a checkbox must not reach the renderer. */
+  fs.writeFileSync(path.join(dir, 'settings.json'), '{"start_quietly":"yes"}');
+  assert.deepStrictEqual(SET.load(), { start_quietly: true }, 'wrong type');
+});
+
+test('settings persist, merge, and drop keys nobody declared', () => {
+  const dir = tmp();
+  SET.init(dir);
+  assert.deepStrictEqual(SET.patch({ start_quietly: false }), { start_quietly: false });
+  assert.deepStrictEqual(SET.load(), { start_quietly: false }, 'survives a reload');
+
+  // an unknown key must not land in the file, and must not disturb what is there
+  assert.deepStrictEqual(SET.patch({ nonsense: true }), { start_quietly: false });
+  assert.deepStrictEqual(Object.keys(JSON.parse(fs.readFileSync(SET.file(), 'utf8'))),
+    ['start_quietly']);
+
+  // a wrong type is ignored rather than written through
+  assert.deepStrictEqual(SET.patch({ start_quietly: 'no' }), { start_quietly: false });
+  assert.deepStrictEqual(SET.patch({ start_quietly: true }), { start_quietly: true });
+  assert.ok(!fs.existsSync(SET.file() + '.tmp'), 'the temp file is renamed, never left behind');
+});
+
+test('launch at login is unsupported off macOS and Windows, and says why', () => {
+  for (const platform of ['linux', 'freebsd', 'aix']) {
+    const agent = LAUNCH.createLaunchAgent({ app: fakeElectronApp(), platform });
+    assert.strictEqual(agent.supported, false, platform);
+    const state = agent.status();
+    assert.deepStrictEqual(state,
+      { supported: false, enabled: false, reason: LAUNCH.UNSUPPORTED_REASON });
+    assert.throws(() => agent.set(true), /only supported on macOS and Windows/);
+  }
+});
+
+test('launch at login reports itself unsupported with no Electron app at all', () => {
+  const agent = LAUNCH.createLaunchAgent({ app: null, platform: 'darwin' });
+  assert.strictEqual(agent.supported, false);
+  assert.strictEqual(agent.status().reason, LAUNCH.HEADLESS_REASON);
+  assert.throws(() => agent.set(true), /headless server/);
+});
+
+test('launch at login asks the OS every time rather than caching what it wrote', () => {
+  const app = fakeElectronApp({ settings: { openAtLogin: false } });
+  const agent = LAUNCH.createLaunchAgent({ app, platform: 'darwin', env: {} });
+
+  assert.deepStrictEqual(agent.status(), { supported: true, enabled: false, reason: null });
+  assert.deepStrictEqual(agent.set(true), { supported: true, enabled: true, reason: null });
+  assert.deepStrictEqual(app.calls.set, [{ openAtLogin: true }], 'macOS gets no path or args');
+
+  /* Removed in System Settings behind the app's back: the next read has to show
+     it, which is the whole reason nothing is cached. */
+  app.getLoginItemSettings = () => ({ openAtLogin: false });
+  assert.strictEqual(agent.status().enabled, false, 'an external removal must win');
+});
+
+test('a macOS read that throws degrades to unsupported instead of breaking the pane', () => {
+  const app = fakeElectronApp({ throwOnGet: new Error('SMAppService is unavailable') });
+  const agent = LAUNCH.createLaunchAgent({ app, platform: 'darwin', env: {} });
+  const state = agent.status();
+  assert.strictEqual(state.supported, false);
+  assert.strictEqual(state.enabled, false);
+  assert.match(state.reason, /SMAppService is unavailable/);
+});
+
+test('a write that throws is surfaced, never swallowed into a lying checkbox', () => {
+  const app = fakeElectronApp({ throwOnSet: new Error('operation not permitted') });
+  const agent = LAUNCH.createLaunchAgent({ app, platform: 'darwin', env: {} });
+  assert.throws(() => agent.set(true), /operation not permitted/);
+});
+
+test('Windows registers the executable that will still exist at the next login', () => {
+  // Installed: its own .exe is already right, so only the marker is added.
+  const installed = fakeElectronApp({ isPackaged: true });
+  LAUNCH.createLaunchAgent({ app: installed, platform: 'win32', env: {} }).set(true);
+  assert.deepStrictEqual(installed.calls.set, [
+    { openAtLogin: true, args: [LAUNCH.LOGIN_ARG] },
+  ]);
+
+  /* Portable: process.execPath is a temp extraction that will be gone by the
+     next login, so the .exe the user actually launched is registered instead. */
+  const portable = fakeElectronApp({ isPackaged: true });
+  LAUNCH.createLaunchAgent({ app: portable, platform: 'win32',
+    env: { PORTABLE_EXECUTABLE_FILE: 'D:\\Apps\\YAC.exe' } }).set(true);
+  assert.deepStrictEqual(portable.calls.set, [
+    { openAtLogin: true, path: 'D:\\Apps\\YAC.exe', args: [LAUNCH.LOGIN_ARG] },
+  ]);
+
+  /* Unpackaged: bare Electron opens its own window unless the project comes
+     with it. */
+  const dev = fakeElectronApp({ isPackaged: false, appPath: 'C:\\src\\yac' });
+  LAUNCH.createLaunchAgent({ app: dev, platform: 'win32', env: {} }).set(true);
+  assert.deepStrictEqual(dev.calls.set, [
+    { openAtLogin: true, path: process.execPath, args: ['C:\\src\\yac', LAUNCH.LOGIN_ARG] },
+  ]);
+
+  // the read is asked about the same command, not a bare path
+  assert.deepStrictEqual(dev.calls.get.at(-1),
+    { path: process.execPath, args: ['C:\\src\\yac', LAUNCH.LOGIN_ARG] });
+});
+
+/* REGRESSION: executableWillLaunchAtLogin sounds like the stricter of the two
+   fields and is not. Electron's own docs say it ignores `args` and is true if
+   the executable would launch "with any arguments", and it reads false even
+   while a registration exists - measured on Electron 43.4.1, where a live
+   getLoginItemSettings returned openAtLogin:true alongside
+   executableWillLaunchAtLogin:false. Preferring it meant the checkbox reported
+   "off" immediately after a write that had in fact worked, so it snapped back
+   on every click and the login item could never be turned on. */
+test('a registered login item is believed even when executableWillLaunchAtLogin is false', () => {
+  const registered = fakeElectronApp({
+    settings: { openAtLogin: true, executableWillLaunchAtLogin: false } });
+  assert.strictEqual(
+    LAUNCH.createLaunchAgent({ app: registered, platform: 'win32', env: {} }).status().enabled,
+    true, 'openAtLogin answers the question that was actually asked');
+
+  // it can still only ever be believed when it says yes
+  const otherArgs = fakeElectronApp({
+    settings: { openAtLogin: false, executableWillLaunchAtLogin: true } });
+  assert.strictEqual(
+    LAUNCH.createLaunchAgent({ app: otherArgs, platform: 'win32', env: {} }).status().enabled,
+    true, 'the same executable registered with different args still launches at login');
+
+  const absent = fakeElectronApp({ settings: { openAtLogin: false } });
+  assert.strictEqual(
+    LAUNCH.createLaunchAgent({ app: absent, platform: 'win32', env: {} }).status().enabled,
+    false);
+});
+
+test('macOS reports the SMAppService status, including one that needs approving', () => {
+  const agentFor = status => LAUNCH.createLaunchAgent({
+    app: fakeElectronApp({ settings: { status, openAtLogin: status === 'enabled' } }),
+    platform: 'darwin', env: {} });
+
+  assert.deepStrictEqual(agentFor('enabled').status(),
+    { supported: true, enabled: true, reason: null });
+  assert.deepStrictEqual(agentFor('not-registered').status(),
+    { supported: true, enabled: false, reason: null });
+
+  /* Switched off in System Settings: the registration still exists, so saying a
+     flat "off" with no explanation leaves nothing to act on. */
+  const approval = agentFor('requires-approval').status();
+  assert.strictEqual(approval.enabled, true);
+  assert.match(approval.reason, /System Settings/);
+
+  const missing = agentFor('not-found').status();
+  assert.strictEqual(missing.enabled, false);
+  assert.match(missing.reason, /could not find/);
+
+  // older macOS and MAS builds report no status at all
+  const legacy = LAUNCH.createLaunchAgent({
+    app: fakeElectronApp({ settings: { openAtLogin: true } }), platform: 'darwin', env: {} });
+  assert.strictEqual(legacy.status().enabled, true);
+});
+
+/* REGRESSION: on macOS Electron's setLoginItemSettings returns undefined
+   whether or not SMAppService accepted the registration - the error is logged
+   natively and dropped - so a failed write looked exactly like a successful
+   one and the pane painted a checkbox that was not true. */
+test('a login-item write that did not take is thrown rather than reported as done', () => {
+  const refuses = fakeElectronApp({ settings: { status: 'not-registered' } });
+  refuses.setLoginItemSettings = () => undefined;      // accepted, and did nothing
+  const agent = LAUNCH.createLaunchAgent({ app: refuses, platform: 'darwin', env: {} });
+  assert.throws(() => agent.set(true), /refused to add/);
+
+  const stuck = fakeElectronApp({ settings: { status: 'enabled', openAtLogin: true } });
+  stuck.setLoginItemSettings = () => undefined;
+  assert.throws(() => LAUNCH.createLaunchAgent({ app: stuck, platform: 'darwin', env: {} }).set(false),
+    /refused to remove/);
+
+  // approval-pending counts as on, so asking for on must not throw
+  const pending = fakeElectronApp({ settings: { status: 'requires-approval' } });
+  pending.setLoginItemSettings = () => undefined;
+  const state = LAUNCH.createLaunchAgent({ app: pending, platform: 'darwin', env: {} }).set(true);
+  assert.strictEqual(state.enabled, true);
+  assert.match(state.reason, /System Settings/);
+});
+
+test('opened-at-login is read from argv on Windows and from the OS on macOS', () => {
+  const app = fakeElectronApp({ settings: { wasOpenedAtLogin: true } });
+
+  // Windows has no wasOpenedAtLogin, so the registered command carries a marker
+  assert.strictEqual(LAUNCH.openedAtLogin({
+    app, platform: 'win32', argv: ['electron.exe', LAUNCH.LOGIN_ARG] }), true);
+  assert.strictEqual(LAUNCH.openedAtLogin({
+    app, platform: 'win32', argv: ['electron.exe'] }), false,
+    'a hand-started Windows app must not be mistaken for a login start');
+
+  assert.strictEqual(LAUNCH.openedAtLogin({ app, platform: 'darwin', argv: [] }), true);
+  assert.strictEqual(LAUNCH.openedAtLogin({
+    app: fakeElectronApp({ settings: { wasOpenedAtLogin: false } }),
+    platform: 'darwin', argv: [] }), false);
+
+  // never true where no login item could have been registered in the first place
+  assert.strictEqual(LAUNCH.openedAtLogin({ app, platform: 'linux', argv: [LAUNCH.LOGIN_ARG] }), false);
+  assert.strictEqual(LAUNCH.openedAtLogin({
+    app: fakeElectronApp({ throwOnGet: new Error('nope') }), platform: 'darwin', argv: [] }), false);
+});

@@ -128,3 +128,136 @@ test('idle selected Cast target exposes and accepts volume without playback cont
   assert.deepStrictEqual(await omittedTarget.json(), { ok: true });
   assert.deepStrictEqual(writes, [{ level: 1 }, { level: 0 }]);
 });
+
+/* ---------- settings ---------- */
+
+const SERVER = require('../server.js');
+
+/* A launch agent the route can drive, standing in for the one main.js injects
+   from Electron. `enabled` is read back through status() so the test proves the
+   route re-reads rather than echoing what it was handed. */
+function fakeLaunchAgent({ supported = true, enabled = false, failWith = null } = {}) {
+  const agent = {
+    supported,
+    writes: [],
+    status: () => (supported
+      ? { supported: true, enabled: agent.enabled, reason: null }
+      : { supported: false, enabled: false, reason: 'no login items on this platform' }),
+    set(value) {
+      agent.writes.push(value);
+      if (failWith) throw failWith;
+      agent.enabled = value;
+      return agent.status();
+    },
+  };
+  agent.enabled = enabled;
+  return agent;
+}
+
+async function settingsServer(t, agent) {
+  SERVER.setLaunchAgent(agent);
+  const server = await listen();
+  t.after(async () => { SERVER.setLaunchAgent(null); await close(server); });
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+const putSettings = (baseUrl, body) => fetch(`${baseUrl}/api/settings`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body),
+});
+
+test('settings round trip through the OS for launch, and through disk for the rest', async t => {
+  const agent = fakeLaunchAgent({ enabled: false });
+  const baseUrl = await settingsServer(t, agent);
+
+  const initial = await (await fetch(`${baseUrl}/api/settings`)).json();
+  assert.deepStrictEqual(initial, {
+    start_quietly: true,
+    launch_at_login: { supported: true, enabled: false, reason: null },
+  });
+
+  const turnedOn = await putSettings(baseUrl, { launch_at_login: true });
+  assert.strictEqual(turnedOn.status, 200);
+  assert.deepStrictEqual((await turnedOn.json()).launch_at_login,
+    { supported: true, enabled: true, reason: null });
+  assert.deepStrictEqual(agent.writes, [true]);
+
+  const quiet = await putSettings(baseUrl, { start_quietly: false });
+  assert.strictEqual(quiet.status, 200);
+  assert.deepStrictEqual(await quiet.json(), {
+    start_quietly: false,
+    launch_at_login: { supported: true, enabled: true, reason: null },
+  }, 'the whole pane comes back, so a client never has to merge a partial reply');
+
+  // written through to disk, not just held in memory
+  assert.deepStrictEqual(
+    JSON.parse(fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8')),
+    { start_quietly: false });
+
+  /* Changed outside the app: the next read reports the machine, not the last
+     thing this process wrote. */
+  agent.enabled = false;
+  assert.strictEqual(
+    (await (await fetch(`${baseUrl}/api/settings`)).json()).launch_at_login.enabled, false);
+});
+
+test('settings refuse anything that is not a boolean, and any unknown key', async t => {
+  const agent = fakeLaunchAgent();
+  const baseUrl = await settingsServer(t, agent);
+
+  for (const body of [{ launch_at_login: 'yes' }, { start_quietly: 1 },
+                      { launch_at_login: null }]) {
+    const response = await putSettings(baseUrl, body);
+    assert.strictEqual(response.status, 400, JSON.stringify(body));
+    assert.match((await response.json()).error, /must be true or false/);
+  }
+
+  const unknown = await putSettings(baseUrl, { make_it_loud: true });
+  assert.strictEqual(unknown.status, 400);
+  assert.deepStrictEqual(await unknown.json(), { error: 'no known setting in the request' });
+
+  const empty = await putSettings(baseUrl, {});
+  assert.strictEqual(empty.status, 400);
+  assert.deepStrictEqual(agent.writes, [], 'nothing reached the OS');
+});
+
+test('an unsupported platform refuses the write instead of pretending it took', async t => {
+  const agent = fakeLaunchAgent({ supported: false });
+  const baseUrl = await settingsServer(t, agent);
+
+  const read = await (await fetch(`${baseUrl}/api/settings`)).json();
+  assert.deepStrictEqual(read.launch_at_login,
+    { supported: false, enabled: false, reason: 'no login items on this platform' });
+
+  const refused = await putSettings(baseUrl, { launch_at_login: true });
+  assert.strictEqual(refused.status, 409);
+  assert.deepStrictEqual(await refused.json(), { error: 'no login items on this platform' });
+  assert.deepStrictEqual(agent.writes, [], 'the agent was never asked');
+
+  // the preference that does not need the OS still works there
+  const quiet = await putSettings(baseUrl, { start_quietly: true });
+  assert.strictEqual(quiet.status, 200);
+});
+
+test('headless, with no Electron to inject an agent, settings still answer', async t => {
+  const baseUrl = await settingsServer(t, null);
+
+  const read = await (await fetch(`${baseUrl}/api/settings`)).json();
+  assert.strictEqual(read.launch_at_login.supported, false);
+  assert.match(read.launch_at_login.reason, /headless server/);
+
+  const refused = await putSettings(baseUrl, { launch_at_login: true });
+  assert.strictEqual(refused.status, 409);
+});
+
+test('a failing login-item write is reported rather than swallowed', async t => {
+  const agent = fakeLaunchAgent({ failWith: new Error('operation not permitted') });
+  const baseUrl = await settingsServer(t, agent);
+
+  const failed = await putSettings(baseUrl, { launch_at_login: true });
+  assert.strictEqual(failed.status, 500);
+  assert.deepStrictEqual(await failed.json(), { error: 'operation not permitted' });
+  assert.strictEqual((await (await fetch(`${baseUrl}/api/settings`)).json())
+    .launch_at_login.enabled, false, 'the checkbox must not be left claiming it worked');
+});

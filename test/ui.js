@@ -152,6 +152,55 @@ app.whenReady().then(async () => {
       return true;
     });
 
+    const SUPPORTED = { start_quietly: true,
+      launch_at_login: { supported: true, enabled: true, reason: null } };
+    const OFF = { start_quietly: true,
+      launch_at_login: { supported: true, enabled: false, reason: null } };
+    const UNSUPPORTED = { start_quietly: true, launch_at_login: {
+      supported: false, enabled: false,
+      reason: 'Starting at login is only supported on macOS and Windows.' } };
+
+    check('the settings pane stays out of the way until it is asked for', () => {
+      const card = document.getElementById('setcard');
+      if (!card.classList.contains('hide')) return 'the pane was open on load';
+      document.getElementById('setbtn').onclick();
+      if (card.classList.contains('hide')) return 'the gear did not open it';
+      if (document.getElementById('setbtn').getAttribute('aria-expanded') !== 'true')
+        return 'aria-expanded was not updated';
+      document.getElementById('setbtn').onclick();
+      if (!card.classList.contains('hide')) return 'the gear did not close it again';
+      return true;
+    });
+
+    check('a platform that cannot start at login says so instead of offering a checkbox', () => {
+      renderSettings(UNSUPPORTED);
+      const box = document.getElementById('setlogin');
+      if (!box.disabled) return 'the checkbox was left clickable';
+      if (box.checked) return 'the checkbox claimed it was on';
+      const why = document.getElementById('setloginwhy').textContent;
+      if (!why.includes('macOS and Windows')) return 'no reason was given: ' + why;
+      return true;
+    });
+
+    check('quiet start is disabled until something actually starts the app', () => {
+      renderSettings(OFF);
+      if (!document.getElementById('setquiet').disabled)
+        return 'quiet start was offered with start-at-login off';
+      renderSettings(SUPPORTED);
+      if (document.getElementById('setquiet').disabled)
+        return 'quiet start stayed disabled with start-at-login on';
+      if (!document.getElementById('setlogin').checked) return 'start-at-login did not paint as on';
+      return true;
+    });
+
+    check('the pane paints what the machine reports, not what was last clicked', () => {
+      renderSettings(SUPPORTED);
+      document.getElementById('setlogin').checked = false;   // as if clicked
+      renderSettings(SUPPORTED);                             // server says otherwise
+      return document.getElementById('setlogin').checked === true
+        ? true : 'a stale click survived a re-render';
+    });
+
     check('casting with no speaker chosen is refused in the page', () => {
       render();
       document.getElementById('url').value = 'https://www.youtube.com/watch?v=I5noeDaJaFQ';
