@@ -258,6 +258,31 @@ async function verifyConnectedRendering(window) {
   assert.strictEqual(report.volumeValue, '42');
 }
 
+async function verifyIdleSelectedRendering(window) {
+  // Arrange - an attached Cast receiver can remain selected without a media session.
+  const idleStatus = {
+    connected: false,
+    protocol: 'cast',
+    device: 'cast:idle-fixture',
+    device_name: 'Idle Fixture',
+    state: 'IDLE',
+    volume: 0.57,
+    muted: true,
+  };
+
+  // Act - let the production popup renderer consume the idle selected status.
+  const report = await showStatus(window, idleStatus,
+    value => value.deviceName === 'Idle Fixture' && value.playbackState === 'Idle',
+    'idle selected Cast status');
+
+  // Assert - playback stays idle while the receiver volume remains actionable.
+  assert.strictEqual(report.nowPlaying, 'Nothing playing');
+  assert.strictEqual(report.volumeDisabled, false);
+  assert.strictEqual(report.volumeValue, '57');
+  assert.strictEqual(report.volumeText, '57%');
+  assert.match(report.controlMessage, /Volume for Idle Fixture\./);
+}
+
 async function verifySandboxedBridge(window) {
   // Arrange - read globals from the context-isolated production renderer.
   // Act - inspect the only API transferred by the production preload.
@@ -810,6 +835,7 @@ async function run() {
       value => !value.browserWindowVisible && !value.hidden && value.visibilityState === 'visible', 3000);
 
     await runCheck('connected renderer', () => verifyConnectedRendering(window));
+    await runCheck('idle selected renderer', () => verifyIdleSelectedRendering(window));
     await runCheck('sandboxed preload', () => verifySandboxedBridge(window));
     await runCheck('unavailable states', () => verifyUnavailableStates(window));
     await runCheck('volume responses', () => verifyVolumeResponses(window));

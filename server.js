@@ -398,6 +398,10 @@ async function teardown() {
 }
 
 const connected = () => !!(S.player || S.sonos);
+const volumeTargetAvailable = () => !!(S.device && (
+  (S.protocol === 'cast' && S.client)
+  || (S.protocol === 'sonos' && S.sonosGroup)
+));
 
 /* "Stop" has to actually mean stop. player.stop() only silences the media and
    leaves the receiver app loaded, so the speaker keeps advertising st=1 with
@@ -1164,8 +1168,28 @@ async function readSonosStatus() {
     expires_in: S.expire ? Math.round(S.expire - Date.now() / 1000) : null };
 }
 
+async function readCastReceiverStatus(client) {
+  try {
+    const status = await p(client, 'getStatus');
+    const receiverVolume = status && status.volume;
+    const level = receiverVolume && Number.isFinite(receiverVolume.level)
+      ? +receiverVolume.level.toFixed(2) : null;
+    return { volume: level, muted: !!(receiverVolume && receiverVolume.muted) };
+  } catch {
+    return { volume: null, muted: false };
+  }
+}
+
 app.get('/api/status', async (req, res) => {
-  if (!connected()) return res.json({ connected: false });
+  if (!connected()) {
+    if (S.protocol !== 'cast' || !volumeTargetAvailable()) {
+      return res.json({ connected: false });
+    }
+    const target = { client: S.client, device: S.device, deviceName: S.deviceName };
+    const receiver = await readCastReceiverStatus(target.client);
+    return res.json({ connected: false, protocol: 'cast', device: target.device,
+      device_name: target.deviceName, state: 'IDLE', ...receiver });
+  }
   if (S.protocol === 'sonos') {
     try { return res.json(await readSonosStatus()); }
     catch (e) { return res.json({ connected: true, protocol: 'sonos',
@@ -1173,9 +1197,7 @@ app.get('/api/status', async (req, res) => {
   }
   try {
     const st = await p(S.player, 'getStatus');
-    let vol = null, muted = false;
-    try { const cs = await p(S.client, 'getStatus');
-      vol = cs && cs.volume ? cs.volume.level : null; muted = !!(cs && cs.volume && cs.volume.muted); } catch {}
+    const receiver = await readCastReceiverStatus(S.client);
     const state = st ? st.playerState : null;
     if (state === 'BUFFERING' && S.lastState === 'PLAYING') S.rebuffers++;
     S.lastState = state;
@@ -1204,7 +1226,7 @@ app.get('/api/status', async (req, res) => {
       device_name: S.deviceName, app: 'Default Media Receiver',
       state, position: (st && st.currentTime) || 0,
       duration: (live && live.duration) || null,
-      volume: vol == null ? null : +vol.toFixed(2), muted, rebuffers: S.rebuffers,
+      volume: receiver.volume, muted: receiver.muted, rebuffers: S.rebuffers,
       media: live, auto_refreshes: S.refreshes,
       queue: queueStatus(),
       expires_in: liveExpire ? Math.round(liveExpire - Date.now() / 1000) : null });
@@ -1213,7 +1235,10 @@ app.get('/api/status', async (req, res) => {
 
 app.post('/api/control', async (req, res) => {
   const { action, target, value } = req.body || {};
-  if (!connected() && action !== 'refresh') return res.status(400).json({ error: 'not connected' });
+  const idleVolumeTarget = action === 'volume' && volumeTargetAvailable();
+  if (!connected() && action !== 'refresh' && !idleVolumeTarget) {
+    return res.status(400).json({ error: 'not connected' });
+  }
   try {
     if (action === 'play') {
       S.pausedByUser = false;

@@ -216,12 +216,13 @@
   function renderStatus(status) {
     const connected = status && status.connected === true;
     const hasError = Boolean(status && status.error);
-    const selected = connected && hasSelectedDevice(status);
+    const selected = hasSelectedDevice(status);
     const target = status && typeof status.device === 'string' && status.device
       ? status.device : null;
     const finiteVolume = Number.isFinite(status && status.volume);
     const canAdjustVolume = selected && Boolean(target) && finiteVolume && !hasError;
-    const stateLabel = connected && !hasError ? formatState(status.state) : 'Disconnected';
+    const statusAvailable = connected || selected;
+    const stateLabel = statusAvailable && !hasError ? formatState(status.state) : 'Disconnected';
     const nextVolumeTarget = canAdjustVolume ? target : null;
     const targetChanged = nextVolumeTarget !== selectedVolumeTarget;
     selectedVolumeTarget = nextVolumeTarget;
@@ -236,11 +237,11 @@
       ? String(status.device_name || 'Selected speaker or group')
       : 'No speaker selected');
     setText(elements.playbackState, stateLabel);
-    elements.playbackState.dataset.state = stateStyle(status && status.state, connected, hasError);
+    elements.playbackState.dataset.state = stateStyle(status && status.state, statusAvailable, hasError);
 
     if (!canAdjustVolume) {
       setVolumeUnavailable();
-      const message = connected
+      const message = connected || selected
         ? 'Volume is unavailable for the selected speaker or group.'
         : 'Open the main window to select a speaker or group.';
       setControlBaseline(message, hasError, false);
