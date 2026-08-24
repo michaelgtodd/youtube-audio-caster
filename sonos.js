@@ -1,6 +1,7 @@
 'use strict';
 
 const SonosLib = require('@svrooij/sonos');
+const YT = require('./youtube.js');
 
 const ACTIVE_STATES = new Set(['playing', 'paused', 'transitioning']);
 const REPEAT_TO_SONOS = { off: 'NORMAL', all: 'REPEAT_ALL', one: 'REPEAT_ONE' };
@@ -88,10 +89,7 @@ function mediaItem(media, entry = {}) {
   return { uri, metadata: xml(metadata) };
 }
 
-const videoIdFromArt = art => {
-  const match = String(art || '').match(/\/vi(?:_webp)?\/([A-Za-z0-9_-]{11})\//);
-  return match ? match[1] : null;
-};
+const videoIdFromArt = art => YT.videoIdFromThumb(art);
 
 function hostFromMdns(service) {
   try {
@@ -122,10 +120,7 @@ function describeQueueItem(item, index, lookup = () => null) {
   };
 }
 
-const expiryOf = uri => {
-  const match = String(uri || '').match(/[?&]expire=(\d+)/);
-  return match ? Number(match[1]) : null;
-};
+const expiryOf = uri => YT.expiryOf(uri);
 
 function repeatFromSonos(mode) {
   if (mode === 'REPEAT_ONE' || mode === 'SHUFFLE_REPEAT_ONE') return 'one';
@@ -500,7 +495,7 @@ class SonosManager {
             const track = await timed(player.currentTrack(), 3000, 'Sonos track');
             group.status_text = track.title || state;
           } catch { group.status_text = state; }
-        }
+        } else group.status_text = '';   // or a stopped group keeps its last track
         this.failures.delete(group.key);
       } catch {
         const failures = (this.failures.get(group.key) || 0) + 1;

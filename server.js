@@ -16,7 +16,7 @@ const GRP = require('./castgroups.js');
 const SO = require('./sonos.js');
 const { videoIdOf, isPlaylistUrl, cdnToken, expiryOf, remember, recall } = ID;
 
-const DMR_APP_ID = 'CC1AD845';
+const DMR_APP_ID = GRP.SOLO_APP;   // 'CC1AD845' - defined once, next to the group app ids
 const YTDLP = process.env.YTDLP || path.join(__dirname, 'bin', 'yt-dlp');
 const DATA_DIR = process.env.CASTAUDIO_DATA || __dirname;
 ID.setStorePath(path.join(DATA_DIR, 'sessions.json'));
@@ -1019,7 +1019,7 @@ app.get('/api/devices', async (req, res) => {
     }
     const devices = deviceList();
     if ((S.discoveryError || SONOS.diagnostics().error) && !devices.length) {
-      return res.json({ devices: [], connected: S.device, settled: true,
+      return res.json({ devices: [], connected: connected() ? S.device : null, settled: true,
         active: null, active_count: 0,
         error: 'Cannot search for speakers on this network.',
         hint: 'Finding Cast and Sonos speakers needs local multicast (UDP ports 5353 and 1900). Allow the app through '

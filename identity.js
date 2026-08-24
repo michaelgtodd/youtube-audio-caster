@@ -15,7 +15,7 @@ const isPlaylistUrl = u => /\/playlist\b/.test(u) || (/[?&]list=/.test(u) && !vi
 /* the googlevideo "id" param is an opaque token for the stream - stable across
    re-issued urls for the same video+format, and NOT the youtube video id */
 const cdnToken = u => (String(u || '').match(/[?&]id=([^&]+)/) || [])[1] || null;
-const expiryOf = u => { const m = String(u || '').match(/[?&]expire=(\d+)/); return m ? +m[1] : null; };
+const { expiryOf } = require('./youtube.js');
 
 const loadStore = () => { try { return JSON.parse(fs.readFileSync(SESSIONS, 'utf8')); } catch { return []; } };
 const saveStore = recs => {
@@ -53,4 +53,4 @@ function recall({ content_id, title, duration } = {}) {
 }
 
 module.exports = { setStorePath, videoIdOf, isPlaylistUrl, cdnToken, expiryOf,
-                   loadStore, remember, recall };
+                   remember, recall };

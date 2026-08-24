@@ -18,7 +18,7 @@ const HEAD  = 3;                  // load this many first so playback starts fas
 const REFRESH_BELOW = 2 * 3600;   // rewrite urls with less than this left
 
 const REPEAT = { off: 'REPEAT_OFF', all: 'REPEAT_ALL', one: 'REPEAT_SINGLE' };
-const expiryOf = u => { const m = String(u || '').match(/[?&]expire=(\d+)/); return m ? +m[1] : null; };
+const { expiryOf, THUMB_ID: YTID, videoIdFromThumb, thumbFor } = require('./youtube.js');
 
 /* A Cast GROUP strips customData off every queue item - metadata survives, ours
    does not. Measured on a real group: item.customData and item.media.customData
@@ -27,15 +27,13 @@ const expiryOf = u => { const m = String(u || '').match(/[?&]expire=(\d+)/); ret
    so identity rides along in a field the group does keep. Without this the
    group queue has no ids, refreshExpiring skips every item for want of a url,
    and playback dies at the six hour expiry. */
-const YTID = /\/vi(?:_webp)?\/([A-Za-z0-9_-]{11})\//;
 const idFromImages = md => {
   for (const im of ((md && md.images) || [])) {
-    const m = YTID.exec((im && im.url) || '');
-    if (m) return m[1];
+    const id = videoIdFromThumb(im && im.url);
+    if (id) return id;
   }
   return null;
 };
-const thumbFor = id => `https://i.ytimg.com/vi/${id}/mqdefault.jpg`;
 
 /* Always leave at least one image whose url carries the video id, so a group
    that drops customData can still be read back. yt-dlp thumbnails already look
@@ -95,4 +93,4 @@ const describe = it => {
 };
 
 module.exports = { BATCH, HEAD, REFRESH_BELOW, REPEAT, expiryOf, idFromImages,
-  imagesFor, thumbFor, item, rawReq, readQueue, describe };
+  thumbFor, item, readQueue, describe };

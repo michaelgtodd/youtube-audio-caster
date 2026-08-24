@@ -133,5 +133,4 @@ function annotate(devices, reports) {
 }
 
 module.exports = { LEADER_APP, FOLLOWER_APP, SOLO_APP, roleFromAppId,
-                   dashId, playingFromMediaStatus, inspect,
-                   readMembers, readPlayback, annotate };
+                   dashId, playingFromMediaStatus, readMembers, readPlayback, annotate };
