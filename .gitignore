@@ -1,6 +1,7 @@
 node_modules/
 dist/
 build/
+.tmp/
 
 # yt-dlp binary is fetched by scripts/fetch-ytdlp.sh (~36MB, goes stale fast)
 bin/
