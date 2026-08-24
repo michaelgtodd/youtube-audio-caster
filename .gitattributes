@@ -1,2 +1,10 @@
 docs/*.png filter=lfs diff=lfs merge=lfs -text
 *.png filter=lfs diff=lfs merge=lfs -text
+
+# The macOS menu-bar templates are committed artwork the app must ship, and they
+# are under a kilobyte each. CI checks out with lfs:false to save bandwidth on
+# the screenshots, which left these as pointer files: the packaging test failed
+# on "not a PNG", and a build would have shipped a text file as the tray icon.
+# Later rules win, so this exempts them from the *.png rule above.
+assets/trayTemplate.png -filter -diff -merge -text
+assets/trayTemplate@2x.png -filter -diff -merge -text

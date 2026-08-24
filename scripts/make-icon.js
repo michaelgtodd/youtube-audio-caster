@@ -82,8 +82,16 @@ const write = (name, c) => { fs.writeFileSync(path.join(OUT, name), png(c)); con
 // Keeping it out of the generator prevents npm install from replacing the source
 // design with the older hand-drawn glyph.
 for (const name of ['trayTemplate.png', 'trayTemplate@2x.png']) {
-  if (!fs.existsSync(path.join(OUT, name)))
+  const file = path.join(OUT, name);
+  if (!fs.existsSync(file))
     throw new Error(`missing supplied macOS menu-bar icon: assets/${name}`);
+  /* Existing is not enough: a checkout without git-lfs leaves a text pointer
+     here, which packages happily and shows up as a blank menu bar icon in the
+     built app. Check the magic bytes so that fails at install instead. */
+  const head = fs.readFileSync(file).subarray(0, 8);
+  if (!head.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])))
+    throw new Error(`assets/${name} is not a PNG - if it starts with `
+      + `"version https://git-lfs..." this checkout needs: git lfs pull`);
   console.log('  ' + name + ' (supplied)');
 }
 // Windows: white glyph over a soft dark halo so it reads on light AND dark taskbars
