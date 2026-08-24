@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-/* Generate tray and app icons with no image dependencies.
-   macOS wants a template icon (black + alpha) which the OS inverts to match the
-   menu bar. Windows does no such thing, so a black icon would vanish against a
-   dark taskbar - it gets a white glyph with a dark halo, legible on both light
-   and dark themes. */
+/* Generate Windows tray and cross-platform app icons with no image dependencies.
+   The supplied macOS template artwork is committed under assets/ so this script
+   deliberately leaves it untouched. Windows does not invert template images, so
+   it gets a white glyph with a dark halo, legible on both taskbar themes. */
 const zlib = require('zlib'), fs = require('fs'), path = require('path');
 
 function canvas(W, H) {
@@ -79,9 +78,13 @@ const OUT = path.join(__dirname, '..', 'assets');
 fs.mkdirSync(OUT, { recursive: true });
 const write = (name, c) => { fs.writeFileSync(path.join(OUT, name), png(c)); console.log('  ' + name); };
 
-// macOS template: black + alpha, the OS inverts it for the menu bar
-for (const [name, size] of [['trayTemplate.png', 32], ['trayTemplate@2x.png', 32]]) {
-  const c = canvas(size, size); glyph(c, size, [0, 0, 0, 255]); write(name, c);
+// macOS template: supplied black + alpha artwork, automatically recolored by macOS.
+// Keeping it out of the generator prevents npm install from replacing the source
+// design with the older hand-drawn glyph.
+for (const name of ['trayTemplate.png', 'trayTemplate@2x.png']) {
+  if (!fs.existsSync(path.join(OUT, name)))
+    throw new Error(`missing supplied macOS menu-bar icon: assets/${name}`);
+  console.log('  ' + name + ' (supplied)');
 }
 // Windows: white glyph over a soft dark halo so it reads on light AND dark taskbars
 {

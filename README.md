@@ -1,17 +1,16 @@
 # YouTube Audio Caster
 
-Play the sound from any YouTube video on a Google speaker — a Nest Mini, Nest Audio,
-Google Home Speaker, or a whole speaker group — while the video plays on your screen,
-kept in sync.
+Play the sound from any YouTube video on a Google Cast or Sonos speaker — including
+Nest, Google Home, Sonos rooms, and whole speaker groups — while the video plays on
+your screen, kept in sync.
 
 ![The app playing a video to a speaker, with the queue alongside](docs/app.png)
 
 ## Why this exists
 
-YouTube won't send a video to a speaker. Speakers don't appear in its cast list at
-all, because they can't show picture. The usual workaround is to mirror your
-computer's sound to the speaker, and that stutters — every hiccup in your Wi-Fi
-becomes a gap in the music.
+YouTube won't send a video to an audio-only Cast speaker, and it does not offer a
+native Sonos target. The usual workaround is to mirror your computer's sound to the
+speaker, and that stutters — every hiccup in your Wi-Fi becomes a gap in the music.
 
 ## The one technical thing worth knowing
 
@@ -43,7 +42,7 @@ that's shared.
 
 ## What you can do
 
-- Send any YouTube video's audio to a speaker or speaker group
+- Send any YouTube video's audio to a Google Cast or Sonos speaker group
 - Watch the video while you listen, automatically kept in step
 - Build playlists, shuffle them, repeat one track or the whole thing
 - Walk away — the speaker keeps going, and picks up the next track itself
@@ -93,7 +92,7 @@ The result lands in `dist/`.
 
 1. Pick your speaker from the dropdown
 2. Paste a YouTube link
-3. Press **Cast**
+3. Press **Play**
 
 Press **＋ Queue** instead and it's added after whatever is already playing.
 
@@ -117,6 +116,11 @@ screen with nothing else on it. Press Esc to come back from either.
 ## Good to know
 
 - Works with YouTube links only
+- Cast and Sonos discovery both require the computer and speakers to be reachable on
+  the local network. Firewalls must allow mDNS on UDP 5353; Sonos can also be found
+  directly through SSDP on UDP 1900.
+- A Sonos group appears as one target and is controlled through its current
+  coordinator, matching how the Sonos app treats grouped rooms.
 - If videos suddenly stop loading, YouTube has probably changed something — run
   `npm run update-ytdlp` and try again
 - The app isn't digitally signed yet, so the first time you open it macOS will warn

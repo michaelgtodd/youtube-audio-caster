@@ -135,7 +135,7 @@ function nowPlaying() {
     line: S.media && S.media.title
       ? `${S.lastState === 'PLAYING' ? '▶' : '❚❚'}  ${S.media.title.slice(0, 40)}`
       : 'Nothing playing',
-    device: S.device ? `on ${S.device}` : 'not connected',
+    device: S.deviceName ? `on ${S.deviceName}` : 'not connected',
   };
 }
 
@@ -197,6 +197,9 @@ app.whenReady().then(async () => {
 }).catch(startupFailed);
 
 
-app.on('before-quit', () => { app.isQuitting = true; });
+app.on('before-quit', () => {
+  app.isQuitting = true;
+  if (serverStarted) { try { require('./server.js').shutdown(); } catch {} }
+});
 // closing the window must NOT quit - the watchdog keeps CDN urls alive
 app.on('window-all-closed', () => { /* stay resident in the tray / menu bar */ });
