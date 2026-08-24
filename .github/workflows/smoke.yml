@@ -89,6 +89,13 @@ jobs:
         shell: bash
         run: npx electron test/renderer-smoke.js
 
+      # The smoke test proves the page loads and wires up. This proves it
+      # renders the right thing: the picker, group notes, the fill spinner and
+      # the guards. It runs on injected device data, so it needs no speakers.
+      - name: UI behaves correctly
+        shell: bash
+        run: npx electron test/ui.js
+
       # The steps above run the source tree, where every file exists by
       # definition. A file missing from the BUILD only shows up in the packaged
       # app - which is how a "cannot find module castqueue.js" crash reached a
