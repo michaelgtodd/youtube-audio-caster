@@ -16,7 +16,7 @@ const RUN_VISIBILITY_CONTRACT = process.env.CI === 'true'
   || process.env.TRAY_POPUP_VISIBILITY_CONTRACT === 'true';
 const REQUIRED_CONTROLS = [
   'control-status', 'device-name', 'now-playing', 'open-window',
-  'playback-state', 'quit', 'volume', 'volume-value',
+  'playback-state', 'playback-toggle', 'quit', 'volume', 'volume-value',
 ];
 
 const problems = [];
@@ -188,6 +188,8 @@ function readPopup(window) {
       missingControls: ${JSON.stringify(REQUIRED_CONTROLS)}.filter(id => !byId(id)),
       nowPlaying: byId('now-playing')?.textContent || '',
       openDisabled: byId('open-window')?.disabled ?? true,
+      toggleDisabled: byId('playback-toggle')?.disabled ?? true,
+      toggleLabel: byId('playback-toggle')?.textContent?.trim() || '',
       playbackState: byId('playback-state')?.textContent || '',
       quitDisabled: byId('quit')?.disabled ?? true,
       readyState: document.readyState,
@@ -343,6 +345,39 @@ async function dispatchVolumeBurst(window, values) {
     }
     return { disabled: slider.disabled, value: slider.value };
   })()`);
+}
+
+/* The panel reported what was playing and gave no way to stop it: pressing the
+   "Playing" label did nothing, which reads as a broken button. */
+async function verifyTransportControl(window) {
+  // Arrange - something is playing, so the button offers to pause it.
+  await showStatus(window, connectedStatus({ state: 'PLAYING' }),
+    value => value.toggleLabel === 'Pause' && !value.toggleDisabled, 'a pausable status');
+  fixture.controlReply = { status: 200, body: { ok: true } };
+  const index = fixture.controlRequests.length;
+
+  // Act - press the real button.
+  await window.webContents.executeJavaScript(`document.getElementById('playback-toggle').click()`);
+  const request = await waitFor('transport request',
+    () => Promise.resolve(fixture.controlRequests[index]), Boolean);
+
+  // Assert - it goes through the same control endpoint the main window uses.
+  assert.deepStrictEqual(request.body, { action: 'pause' });
+  assert.match(request.contentType, /^application\/json/i);
+
+  // A paused speaker offers to start again...
+  await showStatus(window, connectedStatus({ state: 'PAUSED' }),
+    value => value.toggleLabel === 'Play' && !value.toggleDisabled, 'a resumable status');
+  const resumeIndex = fixture.controlRequests.length;
+  await window.webContents.executeJavaScript(`document.getElementById('playback-toggle').click()`);
+  const resume = await waitFor('resume request',
+    () => Promise.resolve(fixture.controlRequests[resumeIndex]), Boolean);
+  assert.deepStrictEqual(resume.body, { action: 'play' });
+
+  // ...and with nothing loaded there is nothing to toggle, so it says so by
+  // being disabled rather than failing when pressed.
+  await showStatus(window, connectedStatus({ state: 'IDLE' }),
+    value => value.toggleDisabled, 'an idle status disables the button');
 }
 
 async function verifyVolumeResponses(window) {
@@ -838,6 +873,7 @@ async function run() {
     await runCheck('idle selected renderer', () => verifyIdleSelectedRendering(window));
     await runCheck('sandboxed preload', () => verifySandboxedBridge(window));
     await runCheck('unavailable states', () => verifyUnavailableStates(window));
+    await runCheck('transport control', () => verifyTransportControl(window));
     await runCheck('volume responses', () => verifyVolumeResponses(window));
     await runCheck('latest-value writer', () => verifyLatestValueWins(window));
     await runCheck('polling lockout', () => verifyPollingLockout(window));

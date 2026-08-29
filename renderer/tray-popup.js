@@ -19,10 +19,13 @@
     nowPlaying: document.getElementById('now-playing'),
     openWindow: document.getElementById('open-window'),
     playbackState: document.getElementById('playback-state'),
+    playbackToggle: document.getElementById('playback-toggle'),
     quit: document.getElementById('quit'),
     volume: document.getElementById('volume'),
     volumeValue: document.getElementById('volume-value'),
   };
+
+  let pendingTransport = null;   // 'play' | 'pause' | null, from the last status
 
   const interaction = {
     edit: null,
@@ -75,6 +78,16 @@
     if (hasError || !connected) return 'error';
     const normalized = String(state || '').toLowerCase();
     return ['buffering', 'playing'].includes(normalized) ? normalized : 'idle';
+  }
+
+  /* PLAYING and BUFFERING are both "make it stop"; PAUSED is "start it again".
+     Anything else - idle, disconnected, nothing loaded - has nothing to toggle,
+     so the button says so by being disabled rather than failing when pressed. */
+  function transportFor(state) {
+    const normalized = String(state || '').trim().toUpperCase();
+    if (normalized === 'PLAYING' || normalized === 'BUFFERING') return { action: 'pause', label: 'Pause' };
+    if (normalized === 'PAUSED') return { action: 'play', label: 'Play' };
+    return null;
   }
 
   function hasSelectedDevice(status) {
@@ -238,6 +251,13 @@
       : 'No speaker selected');
     setText(elements.playbackState, stateLabel);
     elements.playbackState.dataset.state = stateStyle(status && status.state, statusAvailable, hasError);
+
+    const transport = (statusAvailable && !hasError) ? transportFor(status && status.state) : null;
+    pendingTransport = transport ? transport.action : null;
+    setText(elements.playbackToggle, transport ? transport.label : 'Pause');
+    elements.playbackToggle.setAttribute('aria-label', transport ? transport.label : 'Pause');
+    elements.playbackToggle.title = transport ? transport.label : 'Nothing to pause';
+    elements.playbackToggle.disabled = !transport;
 
     if (!canAdjustVolume) {
       setVolumeUnavailable();
@@ -482,6 +502,34 @@
     });
   }
 
+  /* Goes through the same /api/control the main window uses, so pausing from
+     the menu bar and pausing from the window are the same operation. The button
+     is disabled again until the next poll confirms what actually happened,
+     rather than flipping its own label optimistically and lying if the request
+     fails. */
+  async function sendTransport(action) {
+    elements.playbackToggle.disabled = true;
+    try {
+      await requestJson('/api/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      }, VOLUME_REQUEST_TIMEOUT_MS);
+      requestImmediatePoll();
+    } catch {
+      setControlMessage(action === 'pause' ? 'Could not pause the speaker.'
+                                           : 'Could not start the speaker.', true);
+      elements.playbackToggle.disabled = false;
+    }
+  }
+
+  function bindTransportButton() {
+    elements.playbackToggle.addEventListener('click', () => {
+      if (!pendingTransport) return;
+      sendTransport(pendingTransport);
+    });
+  }
+
   function bridgeMethod(name) {
     const bridge = window.trayPopup;
     return bridge && typeof bridge[name] === 'function' ? bridge[name].bind(bridge) : null;
@@ -506,6 +554,7 @@
 
   function initialize() {
     bindVolumeInteraction();
+    bindTransportButton();
     bindPollingVisibility();
     bindBridgeButton(elements.openWindow, 'openWindow');
     bindBridgeButton(elements.quit, 'quit');
