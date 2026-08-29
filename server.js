@@ -14,6 +14,7 @@ const CQ = require('./castqueue.js');
 const ID = require('./identity.js');
 const GRP = require('./castgroups.js');
 const SO = require('./sonos.js');
+const WD = require('./watchdog.js');
 const { videoIdOf, isPlaylistUrl, cdnToken, expiryOf, remember, recall } = ID;
 
 const DMR_APP_ID = GRP.SOLO_APP;   // 'CC1AD845' - defined once, next to the group app ids
@@ -29,6 +30,10 @@ const S = {
   expire: null, cdnUrl: null, refreshes: 0, lastRefresh: 0, errors: [],
   queue: null,          // {playlistId, name, order:[itemIdx], pos, repeat, shuffle}
   queueActive: false,
+  refreshFails: 0,      // consecutive failed re-issues; backs off, then gives up
+  /* Set the moment the user pauses. A paused stream is never kept alive across
+     a url expiry - it is discarded, and pressing play fetches it again. */
+  pausedByUser: false,
 };
 const logErr = m => { S.errors.push({ t: Date.now(), msg: String(m).slice(0, 400) });
   S.errors = S.errors.slice(-25); console.error('[err]', String(m).slice(0, 300)); };
@@ -383,7 +388,7 @@ async function stopEverything() {
   }
   S.qcache = null; S.identity = null; S.media = null;
   S.srcUrl = null; S.expire = null; S.cdnUrl = null;
-  S.queueActive = false;
+  S.queueActive = false; S.pausedByUser = false; S.refreshFails = 0;
   fillToken++; S.fill = null;              // stop means stop filling too
   S.device = null; S.deviceName = null; S.host = null; S.protocol = null;
   groupCache = { at: 0, val: { inGroup: new Map(), groupPlaying: new Map() } };
@@ -568,7 +573,7 @@ async function castUrl(pageUrl, name) {
       ext: m.ext, video_id: m.video_id };
     S.srcUrl = pageUrl; S.rebuffers = 0; S.lastState = null;
     S.expire = expiryOf(m.url); S.cdnUrl = m.url;
-    S.qcache = null; S.queueActive = false;
+    S.qcache = null; S.queueActive = false; S.pausedByUser = false; S.refreshFails = 0;
     remember(m.video_id, pageUrl, m.title, m.duration, m.url, null);
     return S.media;
   }
@@ -592,7 +597,7 @@ async function castUrl(pageUrl, name) {
     ext: m.ext, video_id: m.video_id };
   S.srcUrl = pageUrl; S.rebuffers = 0; S.lastState = null;
   S.expire = expiryOf(m.url); S.cdnUrl = m.url;
-  S.queueActive = false;
+  S.queueActive = false; S.pausedByUser = false; S.refreshFails = 0;
   let sid = null; try { sid = ((await p(client, 'getSessions')) || [])[0]?.sessionId; } catch {}
   remember(m.video_id, pageUrl, m.title, m.duration, m.url, sid);
   return S.media;
@@ -958,23 +963,47 @@ async function reissue(reason) {
         else await p(S.player, 'seek', pos);
       } catch (e) { logErr('seek: ' + e); }
     }
-    S.refreshes++; S.lastRefresh = Date.now();
-  } catch (e) { logErr('auto-refresh failed: ' + e); }
+    S.refreshes++; S.lastRefresh = Date.now(); S.refreshFails = 0;
+  } catch (e) {
+    logErr('auto-refresh failed: ' + e);
+    /* Record the attempt even though it failed, or the next tick tries again
+       fifteen seconds later - and every attempt chimes the speaker. */
+    S.lastRefresh = Date.now();
+    S.refreshFails = (S.refreshFails || 0) + 1;
+    if (S.refreshFails >= WD.GIVE_UP_AFTER) {
+      logErr(`auto-refresh gave up after ${S.refreshFails} tries; leaving the speaker alone`);
+      S.srcUrl = null;                      // disarms the watchdog completely
+    }
+  }
 }
 
 setInterval(async () => {
   try {
     if (!connected() || !S.srcUrl) return;
-    // A queue is refreshed in place by refreshExpiring(); reissue() replaces the
-    // whole media session and would wipe it.
-    if (S.queueActive || (S.protocol === 'cast' && S.qcache)) return;
-    if (Date.now() - S.lastRefresh < 60000) return;
-    if (S.expire && Date.now() / 1000 > S.expire - 300)
-      return void reissue(`cdn url expires in ${Math.round(S.expire - Date.now() / 1000)}s`);
-    if (S.protocol === 'sonos') return;
-    const st = await p(S.player, 'getStatus');
-    if (st && st.playerState === 'IDLE' && ['ERROR', 'INTERRUPTED'].includes(st.idleReason))
-      reissue(`receiver went IDLE (${st.idleReason})`);
+    if (!WD.mayRetry({ fails: S.refreshFails, lastAttempt: S.lastRefresh, now: Date.now() })) return;
+
+    /* Ask the speaker what it is doing rather than going on expiry alone. A
+       paused stream used to be reloaded - with autoplay - the moment its url
+       neared expiry, which is how a speaker started playing again hours after
+       it was paused. */
+    let playerState = null, idleReason = null;
+    if (S.protocol === 'sonos') {
+      try { playerState = (await S.sonos.getCurrentState()) === 'playing' ? 'PLAYING' : 'PAUSED'; }
+      catch { return; }
+    } else {
+      const st = await p(S.player, 'getStatus');
+      playerState = st ? st.playerState : null;
+      idleReason = st ? st.idleReason : null;
+    }
+
+    const reason = WD.reissueReason({
+      hasSource: !!S.srcUrl,
+      queueActive: S.queueActive || (S.protocol === 'cast' && !!S.qcache),
+      pausedByUser: S.pausedByUser,
+      playerState, idleReason,
+      expire: S.expire, now: Date.now() / 1000,
+    });
+    if (reason) reissue(reason);
   } catch (e) { /* transient */ }
 }, 15000);
 
@@ -1160,8 +1189,16 @@ app.post('/api/control', async (req, res) => {
   if (!connected() && action !== 'refresh') return res.status(400).json({ error: 'not connected' });
   try {
     if (action === 'play') {
-      if (S.protocol === 'sonos') await S.sonos.play(); else await p(S.player, 'play');
+      S.pausedByUser = false;
+      /* The url may have died while it sat paused - the watchdog deliberately
+         does not keep paused streams alive - so fetch a fresh one first. */
+      if (!S.queueActive && !S.qcache && WD.expiredFor(S.expire, Date.now() / 1000)) {
+        console.log('[play] the paused url has expired; fetching a fresh one');
+        await reissue('play pressed on an expired url');
+      } else if (S.protocol === 'sonos') await S.sonos.play();
+      else await p(S.player, 'play');
     } else if (action === 'pause') {
+      S.pausedByUser = true;
       if (S.protocol === 'sonos') await S.sonos.pause(); else await p(S.player, 'pause');
     }
     else if (action === 'stop') await stopEverything();
@@ -1180,7 +1217,13 @@ app.post('/api/control', async (req, res) => {
 });
 
 app.post('/api/clientlog', (req, res) => {
-  console.log('[client]', String((req.body || {}).msg || '').slice(0, 200));
+  const { msg, level } = req.body || {};
+  const text = String(msg || '').slice(0, 300);
+  /* A packaged app prints to nowhere anybody can see, so a renderer error that
+     only reached the console was invisible - /api/errors stayed empty while the
+     window was throwing. Faults go in the error buffer; chatter stays a log. */
+  if (level === 'error' || /^(js error|unhandled rejection):/.test(text)) logErr('[client] ' + text);
+  else console.log('[client]', text.slice(0, 200));
   res.json({ ok: true });
 });
 

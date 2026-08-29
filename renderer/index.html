@@ -254,9 +254,19 @@ const $=id=>document.getElementById(id);
 let YT_PLAYER=null, YT_READY=false, CUR_VID=null, SYNCING=false, PENDING_VID=null;
 
 /* send diagnostics to the server log so problems are visible without a debugger */
-function clog(msg){ try{ fetch('/api/clientlog',{method:'POST',
-  headers:{'Content-Type':'application/json'},body:JSON.stringify({msg})}); }catch(e){} }
-window.addEventListener('error', e => clog('js error: '+e.message));
+function clog(msg, level){ try{ fetch('/api/clientlog',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({msg, level})}); }catch(e){} }
+
+/* Both of these, not just the first. A rejected promise and an uncaught throw
+   look identical to someone watching the app misbehave, but only throws were
+   ever reported - so a loop rejecting once a second showed up as console spam
+   with nothing in the app's own diagnostics. */
+window.addEventListener('error', e =>
+  clog(`js error: ${e.message} (${(e.filename||'?').split('/').pop()}:${e.lineno||0})`, 'error'));
+window.addEventListener('unhandledrejection', e => {
+  const r = e.reason;
+  clog('unhandled rejection: ' + ((r && (r.message || r.stack)) || String(r)), 'error');
+});
 
 /* The IFrame API is loaded programmatically and POLLED for readiness. Relying on
    the onYouTubeIframeAPIReady callback alone is fragile: if the script is served
