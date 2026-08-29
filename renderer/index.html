@@ -54,6 +54,14 @@ button:disabled{opacity:.45;cursor:default}
 .time{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);
   font-variant-numeric:tabular-nums}
 .msg{font-size:13px;padding:10px 12px;border-radius:8px;margin-top:10px}
+/* Which build is this. A release shows just its number; anything built after
+   one is marked, because "1.3.3" and "something after 1.3.3" look identical
+   otherwise and behave differently when a bug is reported. */
+.ver{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:999px;
+  font-size:11px;letter-spacing:.02em;vertical-align:middle;
+  background:rgba(127,127,127,.16);color:inherit;opacity:.75;cursor:default}
+.ver.hide{display:none}
+.ver.beta{background:rgba(230,160,30,.18);opacity:.95}
 /* Building a queue means one yt-dlp call per track, about ten seconds each, so
    a ten track playlist keeps arriving for over a minute. Without a marker the
    list just looks short and finished. */
@@ -156,7 +164,8 @@ button.mini.done{background:var(--ok)}
 <button class="ghost mini" id="exitexpand" title="Exit theater mode (Esc)">✕ Exit</button>
 <div class="wrap">
   <h1>YouTube Audio Caster</h1>
-  <div class="sub">Native buffered audio to Cast and Sonos speakers &middot; video stays local &amp; synced</div>
+  <div class="sub">Native buffered audio to Cast and Sonos speakers &middot; video stays local &amp; synced
+    <span id="ver" class="ver hide" title=""></span></div>
 
   <div class="card">
     <div class="row">
@@ -1062,6 +1071,19 @@ async function tick(){
   }catch(e){}
   setTimeout(tick,1000);
 }
+/* Shown once; it cannot change without the app restarting. */
+(async () => {
+  try {
+    const v = await api('/api/version');
+    if (!v || !v.label) return;
+    const el = $('ver');
+    el.textContent = 'v' + v.label;
+    el.title = v.detail || (v.released ? 'this is a released build' : '');
+    el.classList.toggle('beta', !v.released);
+    el.classList.remove('hide');
+  } catch (e) { /* an old server without /api/version: just leave it hidden */ }
+})();
+
 loadDevices(false); loadPlaylists(); tick();
 </script>
 </body></html>

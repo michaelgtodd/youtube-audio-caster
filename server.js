@@ -15,6 +15,7 @@ const ID = require('./identity.js');
 const GRP = require('./castgroups.js');
 const SO = require('./sonos.js');
 const WD = require('./watchdog.js');
+const VER = require('./version.js');
 const { videoIdOf, isPlaylistUrl, cdnToken, expiryOf, remember, recall } = ID;
 
 const DMR_APP_ID = GRP.SOLO_APP;   // 'CC1AD845' - defined once, next to the group app ids
@@ -35,6 +36,10 @@ const S = {
      a url expiry - it is discarded, and pressing play fetches it again. */
   pausedByUser: false,
 };
+
+S.build = VER.describeBuild(VER.resolveBuild(__dirname));
+console.log(`  build ${S.build.label}${S.build.detail ? ' (' + S.build.detail + ')' : ''}`);
+
 const logErr = m => { S.errors.push({ t: Date.now(), msg: String(m).slice(0, 400) });
   S.errors = S.errors.slice(-25); console.error('[err]', String(m).slice(0, 300)); };
 
@@ -1409,6 +1414,8 @@ app.get('/api/diagnostics', (req, res) => res.json({
   connected: S.device,
   recent_errors: S.errors.slice(-5),
 }));
+
+app.get('/api/version', (req, res) => res.json(S.build));
 
 app.get('/api/errors', (req, res) => res.json({ errors: S.errors.slice(-10) }));
 

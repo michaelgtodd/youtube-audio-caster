@@ -20,6 +20,11 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
 
 app.whenReady().then(async () => {
   const port = await freePort();
+  /* @svrooij/sonos listens for UPnP events on a FIXED port (6329) unless told
+     otherwise. Running this while the real app is up means a second bind of the
+     same port, which throws and puts a modal error on screen - the test then
+     hangs until somebody clicks it. Give the harness its own port. */
+  process.env.SONOS_LISTENER_PORT = String(await freePort());
   await require('../server.js').start(port, '127.0.0.1');
 
   const win = new BrowserWindow({ show: false, width: 1200, height: 900,

@@ -37,6 +37,11 @@ const FIXTURE = [
 
 app.whenReady().then(async () => {
   const port = await freePort();
+  /* @svrooij/sonos listens for UPnP events on a FIXED port (6329) unless told
+     otherwise. Running this while the real app is up means a second bind of the
+     same port, which throws and puts a modal error on screen - the test then
+     hangs until somebody clicks it. Give the harness its own port. */
+  process.env.SONOS_LISTENER_PORT = String(await freePort());
   await require('../server.js').start(port, '127.0.0.1');
   const win = new BrowserWindow({ show: false, width: 1200, height: 900,
     webPreferences: { contextIsolation: true } });
@@ -130,6 +135,20 @@ app.whenReady().then(async () => {
         return 'wrong remaining count: ' + document.getElementById('qfilltext').textContent;
       fillNote(null);
       if (!el.classList.contains('hide')) return 'spinner stayed up after the fill finished';
+      return true;
+    });
+
+    check('the build version is shown, and marked when it is not a release', () => {
+      const el = document.getElementById('ver');
+      if (!el) return 'no version element';
+      if (el.classList.contains('hide')) return 'version pill never appeared';
+      /* no backslash escapes here: this whole check is inside a template
+         literal, where \d would collapse to a plain d before the page sees it */
+      const txt = el.textContent || '';
+      if (txt[0] !== 'v' || !/[0-9]/.test(txt.slice(1, 2))) return 'unexpected text: ' + txt;
+      // the test harness runs from a working tree, so this is never a release
+      if (!el.classList.contains('beta')) return 'a non-release build must be marked: ' + el.textContent;
+      if (!el.title) return 'no explanation in the tooltip';
       return true;
     });
 

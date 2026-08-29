@@ -27,8 +27,23 @@ function startupFailed(err) {
 process.on('uncaughtException', startupFailed);
 process.on('unhandledRejection', startupFailed);
 
-/* Two instances would race for the same speaker and start two servers. */
-if (!app.requestSingleInstanceLock()) { app.quit(); return; }
+/* Two instances would race for the same speaker and start two servers.
+
+   The losing copy used to quit without a word, which is fine when you simply
+   double-clicked the icon twice, and badly misleading when you have just built
+   a new version: it looks like the new build started, the old one raises its
+   window, and you carry on testing the old code. So the copy that gives way
+   says which build it was, and hands that to the copy that holds the lock. */
+const VER = require('./version.js');
+const BUILD = VER.describeBuild(VER.resolveBuild(__dirname));
+
+if (!app.requestSingleInstanceLock({ version: BUILD.label })) {
+  console.log(`[startup] YouTube Audio Caster ${BUILD.label} is exiting: `
+    + 'another copy already holds the single-instance lock. '
+    + 'Quit the running copy from the menu bar icon before starting this one.');
+  app.quit();
+  return;
+}
 
 process.env.CASTAUDIO_DATA = app.getPath('userData');
 const binDir = app.isPackaged ? path.join(process.resourcesPath, 'bin') : path.join(__dirname, 'bin');
@@ -181,7 +196,24 @@ function buildTray() {
   }
 }
 
-app.on('second-instance', () => showWindow());
+/* Raising the window is the right answer when it is the same build - somebody
+   clicked the icon again. When the versions differ it is almost always someone
+   trying to run a build they just made, so say plainly that it did not start. */
+app.on('second-instance', (_event, _argv, _cwd, extra) => {
+  const other = extra && extra.version;
+  showWindow();
+  if (other && other !== BUILD.label) {
+    dialog.showMessageBox({
+      type: 'warning',
+      title: 'Another version tried to start',
+      message: `Version ${other} did not start.`,
+      detail: `This copy (${BUILD.label}) is already running, and only one copy `
+        + `can run at a time.\n\nTo run ${other}, quit this one first: `
+        + `right-click the menu bar icon and choose Quit.`,
+      buttons: ['OK'],
+    }).catch(() => {});
+  }
+});
 
 app.whenReady().then(async () => {
   /* macOS: a menu-bar app with no Dock icon - the tray is how you get back.

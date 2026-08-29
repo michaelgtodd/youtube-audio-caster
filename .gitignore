@@ -19,3 +19,6 @@ playlists.json
 playlists.json.tmp
 settings.json
 .DS_Store
+
+# stamped at pack time by scripts/build-info.js
+build-info.json
