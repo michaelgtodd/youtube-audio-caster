@@ -1,5 +1,7 @@
 'use strict';
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, Notification, dialog } = require('electron');
+const {
+  app, BrowserWindow, Tray, ipcMain, nativeImage, nativeTheme, screen, shell, Notification, dialog,
+} = require('electron');
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
@@ -48,8 +50,24 @@ if (!app.requestSingleInstanceLock({ version: BUILD.label })) {
 process.env.CASTAUDIO_DATA = app.getPath('userData');
 const binDir = app.isPackaged ? path.join(process.resourcesPath, 'bin') : path.join(__dirname, 'bin');
 process.env.YTDLP = path.join(binDir, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+const { calculateTrayPopupPosition } = require('./tray-popup-position.js');
+const SETTINGS = require('./settings.js');
+const { createLaunchAgent, openedAtLogin } = require('./launch-at-login.js');
+const {
+  bindTrayActivation,
+  bindTrayPopup,
+  isLivePopup,
+  isTrustedTrayPopupIpc: validateTrayPopupIpc,
+} = require('./tray-popup-wiring.js');
 
-let win = null, tray = null, PORT = null, serverStarted = false;
+const TRAY_POPUP_WIDTH = 280;
+const TRAY_POPUP_HEIGHT = 182;
+const TRAY_BLUR_TOGGLE_WINDOW_MS = 250;
+const OPEN_WINDOW_CHANNEL = 'tray-popup:open-window';
+const QUIT_CHANNEL = 'tray-popup:quit';
+
+let win = null, tray = null, trayPopup = null, trayPopupLoadPromise = null;
+let trayPopupBlurredAt = 0, PORT = null, serverStarted = false;
 
 const flagFile = () => path.join(app.getPath('userData'), 'ui-flags.json');
 const flags = () => { try { return JSON.parse(fs.readFileSync(flagFile(), 'utf8')); } catch { return {}; } };
@@ -131,18 +149,157 @@ async function showWindow() {
   win.once('ready-to-show', () => win.show());
 }
 
-/* Left-click toggles. Note this hides rather than minimises: the dock is hidden,
-   so a minimised window would go to a dock that is not on screen. hide() looks
-   identical and the tray brings it straight back. If the window is up but buried
-   behind something else, raise it instead of hiding it. */
-function toggleWindow() {
-  if (win && !win.isDestroyed() && win.isVisible()) {
-    if (win.isFocused()) win.hide();
-    else { win.show(); win.focus(); }
+/* A first quiet start is indistinguishable from the app not having started at
+   all: no window, no taskbar button, just an icon most people have never had a
+   reason to look at. Point at it once - the same treatment, and the same
+   once-only flag, that closing to the tray already gets. */
+function quietHint() {
+  if (flags().quietHintShown || !Notification.isSupported()) return;
+  setFlag('quietHintShown', true);
+  new Notification({
+    title: 'YouTube Audio Caster started',
+    body: `It is running in the ${isMac ? 'menu bar' : 'notification area'}. `
+      + 'Click its icon to open the app or change this in Settings.',
+    icon: path.join(__dirname, 'assets', 'icon.png'),
+  }).show();
+}
+
+function getTrayPopupUrl() {
+  if (!Number.isInteger(PORT)) throw new Error('tray popup requested before the server started');
+  return `http://127.0.0.1:${PORT}/tray-popup.html`;
+}
+
+function isLiveTrayPopup(popup = trayPopup) {
+  return isLivePopup(popup);
+}
+
+function hideTrayPopup() {
+  if (isLiveTrayPopup() && trayPopup.isVisible()) trayPopup.hide();
+}
+
+function createTrayPopup() {
+  const popup = new BrowserWindow({
+    width: TRAY_POPUP_WIDTH,
+    height: TRAY_POPUP_HEIGHT,
+    show: false,
+    frame: false,
+    resizable: false,
+    skipTaskbar: true,
+    focusable: true,
+    fullscreenable: false,
+    ...(isMac ? {
+      vibrancy: 'menu',
+      visualEffectState: 'followWindow',
+      hasShadow: true,
+      roundedCorners: true,
+    } : {
+      backgroundColor: nativeTheme.shouldUseDarkColors ? '#232325' : '#f7f7f8',
+    }),
+    webPreferences: {
+      preload: path.join(__dirname, 'tray-popup-preload.js'),
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+    },
+  });
+  trayPopupBlurredAt = 0;
+  trayPopup = popup;
+  bindTrayPopup({
+    popup,
+    isWindows: isWin,
+    getTray: () => tray,
+    onBlurred: () => { trayPopupBlurredAt = Date.now(); },
+    onClosed: () => {
+      if (trayPopup !== popup) return;
+      trayPopup = null;
+      trayPopupLoadPromise = null;
+      trayPopupBlurredAt = 0;
+    },
+  });
+  trayPopupLoadPromise = popup.loadURL(getTrayPopupUrl());
+  return popup;
+}
+
+async function ensureTrayPopup() {
+  await ensureServer();
+  const popup = isLiveTrayPopup() ? trayPopup : createTrayPopup();
+  const loadPromise = trayPopupLoadPromise;
+  if (loadPromise) {
+    try {
+      await loadPromise;
+    } catch (error) {
+      if (!popup.isDestroyed()) popup.destroy();
+      throw error;
+    } finally {
+      if (trayPopup === popup && trayPopupLoadPromise === loadPromise) trayPopupLoadPromise = null;
+    }
+  }
+  if (!isLiveTrayPopup(popup) || trayPopup !== popup) throw new Error('tray popup was destroyed while loading');
+  return popup;
+}
+
+function positionTrayPopup(popup) {
+  const trayBounds = tray.getBounds();
+  const display = screen.getDisplayMatching(trayBounds);
+  const [width, height] = popup.getSize();
+  const position = calculateTrayPopupPosition({
+    trayBounds,
+    displayBounds: display.bounds,
+    workArea: display.workArea,
+    popupSize: { width, height },
+  });
+  popup.setPosition(position.x, position.y, false);
+}
+
+async function toggleTrayPopup() {
+  const popup = await ensureTrayPopup();
+  if (popup.isVisible()) {
+    popup.hide();
     return;
   }
-  showWindow();
+  /* Clicking the tray can blur (and therefore hide) the popup before Electron
+     emits the tray click. Treat that event as the requested toggle-off instead
+     of immediately showing the popup again. */
+  if (Date.now() - trayPopupBlurredAt < TRAY_BLUR_TOGGLE_WINDOW_MS) {
+    trayPopupBlurredAt = 0;
+    return;
+  }
+  if (!tray || tray.isDestroyed()) return;
+  positionTrayPopup(popup);
+  trayPopupBlurredAt = 0;
+  popup.show();
+  popup.focus();
 }
+
+function handleTrayActivation() {
+  toggleTrayPopup().catch(error => console.error('[tray] could not show popup:', error.message));
+}
+
+function isTrustedTrayPopupIpc(event, args) {
+  return validateTrayPopupIpc({
+    event,
+    args,
+    popup: trayPopup,
+    getExpectedUrl: getTrayPopupUrl,
+  });
+}
+
+function authorizeTrayPopupIpc(event, args) {
+  if (!isTrustedTrayPopupIpc(event, args)) throw new Error('Unauthorized tray popup action');
+}
+
+ipcMain.handle(OPEN_WINDOW_CHANNEL, async (event, ...args) => {
+  authorizeTrayPopupIpc(event, args);
+  hideTrayPopup();
+  await showWindow();
+});
+
+ipcMain.handle(QUIT_CHANNEL, (event, ...args) => {
+  authorizeTrayPopupIpc(event, args);
+  hideTrayPopup();
+  app.isQuitting = true;
+  app.quit();
+});
 
 function nowPlaying() {
   const S = require('./server.js').S;
@@ -152,19 +309,6 @@ function nowPlaying() {
       : 'Nothing playing',
     device: S.deviceName ? `on ${S.deviceName}` : 'not connected',
   };
-}
-
-/* Built fresh each time it is popped up, so it never shows stale track info. */
-function buildMenu() {
-  const np = nowPlaying();
-  return Menu.buildFromTemplate([
-    { label: np.line, enabled: false },
-    { label: np.device, enabled: false },
-    { type: 'separator' },
-    { label: 'Open Window', click: () => showWindow() },
-    { type: 'separator' },
-    { label: 'Quit (stops auto-refresh)', click: () => { app.isQuitting = true; app.quit(); } },
-  ]);
 }
 
 function buildTray() {
@@ -183,17 +327,9 @@ function buildTray() {
   updateTip();
   setInterval(updateTip, 5000);
 
-  /* macOS: setContextMenu() would make a LEFT click open the menu and swallow the
-     click event, so the two buttons are wired separately.
-     Windows: a tray icon is expected to have a context menu attached; left click
-     still fires 'click' there, so both behaviours work with it assigned. */
-  tray.on('click', () => toggleWindow());
-  if (isWin) {
-    tray.setContextMenu(buildMenu());
-    setInterval(() => tray.setContextMenu(buildMenu()), 5000);
-  } else {
-    tray.on('right-click', () => tray.popUpContextMenu(buildMenu()));
-  }
+  /* The HTML popup is shared by both buttons so its slider remains keyboard
+     accessible; no native context menu is attached to compete for right-click. */
+  bindTrayActivation(tray, handleTrayActivation);
 }
 
 /* Raising the window is the right answer when it is the same build - somebody
@@ -221,10 +357,23 @@ app.whenReady().then(async () => {
      tray is an addition rather than the only way in. */
   if (isMac && app.dock) app.dock.hide();
   if (isWin) app.setAppUserModelId('com.michaelgtodd.youtube-audio-caster');
+  SETTINGS.init(app.getPath('userData'));
+  require('./server.js').setLaunchAgent(createLaunchAgent({ app }));
   await ensureServer();
+  let trayUp = true;
   try { buildTray(); }
-  catch (e) { console.error('[tray] unavailable:', e.message); }   // not fatal
-  await showWindow();
+  catch (e) { trayUp = false; console.error('[tray] unavailable:', e.message); }   // not fatal
+  /* Started by the login item and asked to keep quiet: the tray is the entire
+     interface, and a window on every boot is not what "start at login" means
+     for an app that lives in the menu bar. The server is up either way - that
+     is the point of starting at all.
+
+     If the tray could not be built there is nothing left to click, so show the
+     window regardless rather than leave a running process with no way in. That
+     is precisely the failure smoke.yml was written for. */
+  const quietly = trayUp && openedAtLogin({ app }) && SETTINGS.load().start_quietly;
+  if (quietly) { console.log('[startup] opened at login; staying in the tray'); quietHint(); }
+  else await showWindow();
   app.on('activate', () => showWindow());
 }).catch(startupFailed);
 

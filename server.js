@@ -10,12 +10,20 @@ const { execFile } = require('child_process');
 const { Client, DefaultMediaReceiver } = require('castv2-client');
 const { Bonjour } = require('bonjour-service');
 const PL = require('./playlists.js');
+const SET = require('./settings.js');
 const CQ = require('./castqueue.js');
 const ID = require('./identity.js');
 const GRP = require('./castgroups.js');
 const SO = require('./sonos.js');
 const WD = require('./watchdog.js');
 const VER = require('./version.js');
+const LAUNCH = require('./launch-at-login.js');
+const {
+  DEFAULT_OPERATION_TIMEOUT_MS,
+  createVolumeWriteCoordinator,
+  isVolumeTargetCurrent,
+  normalizeVolume,
+} = require('./volume-write-coordinator.js');
 const { videoIdOf, isPlaylistUrl, cdnToken, expiryOf, remember, recall } = ID;
 
 const DMR_APP_ID = GRP.SOLO_APP;   // 'CC1AD845' - defined once, next to the group app ids
@@ -23,6 +31,16 @@ const YTDLP = process.env.YTDLP || path.join(__dirname, 'bin', 'yt-dlp');
 const DATA_DIR = process.env.CASTAUDIO_DATA || __dirname;
 ID.setStorePath(path.join(DATA_DIR, 'sessions.json'));
 PL.init(DATA_DIR);
+SET.init(DATA_DIR);
+
+/* Only Electron can register a login item, and this server also runs headless,
+   where there is nothing to register one with. main.js injects an agent once
+   the app is ready; without it the setting reports itself unsupported and the
+   pane says why. Same shape as ID.setStorePath and PL.init above. */
+let launchAgent = null;
+const setLaunchAgent = agent => { launchAgent = agent; };
+const launchStatus = () => (launchAgent ? launchAgent.status()
+  : { supported: false, enabled: false, reason: LAUNCH.HEADLESS_REASON });
 
 const S = {
   devices: [], client: null, player: null, device: null, host: null,
@@ -370,12 +388,32 @@ const pconnect = (host, port) => new Promise((res, rej) => {
 const p = (obj, fn, ...a) => new Promise((res, rej) =>
   obj[fn](...a, (e, r) => e ? rej(e) : res(r)));
 
+const volumeWrites = createVolumeWriteCoordinator({
+  operationTimeoutMs: DEFAULT_OPERATION_TIMEOUT_MS,
+});
+
+function snapshotVolumeWrite() {
+  const target = S.device;
+  if (S.protocol === 'sonos') {
+    const control = S.sonosGroup;
+    if (!target || !control) throw new Error('volume control is unavailable');
+    return { target, write: level => control.SetGroupVolume(Math.round(level * 100)) };
+  }
+  const control = S.client;
+  if (!target || !control) throw new Error('volume control is unavailable');
+  return { target, write: level => p(control, 'setVolume', { level }) };
+}
+
 async function teardown() {
   try { S.client && S.client.close(); } catch {}
   S.client = null; S.player = null; S.sonos = null; S.sonosGroup = null;
 }
 
 const connected = () => !!(S.player || S.sonos);
+const volumeTargetAvailable = () => !!(S.device && (
+  (S.protocol === 'cast' && S.client)
+  || (S.protocol === 'sonos' && S.sonosGroup)
+));
 
 /* "Stop" has to actually mean stop. player.stop() only silences the media and
    leaves the receiver app loaded, so the speaker keeps advertising st=1 with
@@ -1142,8 +1180,28 @@ async function readSonosStatus() {
     expires_in: S.expire ? Math.round(S.expire - Date.now() / 1000) : null };
 }
 
+async function readCastReceiverStatus(client) {
+  try {
+    const status = await p(client, 'getStatus');
+    const receiverVolume = status && status.volume;
+    const level = receiverVolume && Number.isFinite(receiverVolume.level)
+      ? +receiverVolume.level.toFixed(2) : null;
+    return { volume: level, muted: !!(receiverVolume && receiverVolume.muted) };
+  } catch {
+    return { volume: null, muted: false };
+  }
+}
+
 app.get('/api/status', async (req, res) => {
-  if (!connected()) return res.json({ connected: false });
+  if (!connected()) {
+    if (S.protocol !== 'cast' || !volumeTargetAvailable()) {
+      return res.json({ connected: false });
+    }
+    const target = { client: S.client, device: S.device, deviceName: S.deviceName };
+    const receiver = await readCastReceiverStatus(target.client);
+    return res.json({ connected: false, protocol: 'cast', device: target.device,
+      device_name: target.deviceName, state: 'IDLE', ...receiver });
+  }
   if (S.protocol === 'sonos') {
     try { return res.json(await readSonosStatus()); }
     catch (e) { return res.json({ connected: true, protocol: 'sonos',
@@ -1151,9 +1209,7 @@ app.get('/api/status', async (req, res) => {
   }
   try {
     const st = await p(S.player, 'getStatus');
-    let vol = null, muted = false;
-    try { const cs = await p(S.client, 'getStatus');
-      vol = cs && cs.volume ? cs.volume.level : null; muted = !!(cs && cs.volume && cs.volume.muted); } catch {}
+    const receiver = await readCastReceiverStatus(S.client);
     const state = st ? st.playerState : null;
     if (state === 'BUFFERING' && S.lastState === 'PLAYING') S.rebuffers++;
     S.lastState = state;
@@ -1182,7 +1238,7 @@ app.get('/api/status', async (req, res) => {
       device_name: S.deviceName, app: 'Default Media Receiver',
       state, position: (st && st.currentTime) || 0,
       duration: (live && live.duration) || null,
-      volume: vol == null ? null : +vol.toFixed(2), muted, rebuffers: S.rebuffers,
+      volume: receiver.volume, muted: receiver.muted, rebuffers: S.rebuffers,
       media: live, auto_refreshes: S.refreshes,
       queue: queueStatus(),
       expires_in: liveExpire ? Math.round(liveExpire - Date.now() / 1000) : null });
@@ -1190,8 +1246,11 @@ app.get('/api/status', async (req, res) => {
 });
 
 app.post('/api/control', async (req, res) => {
-  const { action, value } = req.body || {};
-  if (!connected() && action !== 'refresh') return res.status(400).json({ error: 'not connected' });
+  const { action, target, value } = req.body || {};
+  const idleVolumeTarget = action === 'volume' && volumeTargetAvailable();
+  if (!connected() && action !== 'refresh' && !idleVolumeTarget) {
+    return res.status(400).json({ error: 'not connected' });
+  }
   try {
     if (action === 'play') {
       S.pausedByUser = false;
@@ -1211,9 +1270,14 @@ app.post('/api/control', async (req, res) => {
       if (S.protocol === 'sonos') await S.sonos.seek(Number(value) || 0);
       else await p(S.player, 'seek', Number(value) || 0);
     } else if (action === 'volume') {
-      const level = Math.max(0, Math.min(1, Number(value)));
-      if (S.protocol === 'sonos') await S.sonosGroup.SetGroupVolume(Math.round(level * 100));
-      else await p(S.client, 'setVolume', { level });
+      if (!isVolumeTargetCurrent(target, S.device)) {
+        return res.status(409).json({ error: 'selected speaker or group changed' });
+      }
+      let level;
+      try { level = normalizeVolume(value); }
+      catch { return res.status(400).json({ error: 'volume must be a finite number' }); }
+      const operation = snapshotVolumeWrite();
+      await volumeWrites.submit({ ...operation, value: level });
     }
     else if (action === 'refresh') await reissue('manual');
     else return res.status(400).json({ error: 'unknown action ' + action });
@@ -1230,6 +1294,37 @@ app.post('/api/clientlog', (req, res) => {
   if (level === 'error' || /^(js error|unhandled rejection):/.test(text)) logErr('[client] ' + text);
   else console.log('[client]', text.slice(0, 200));
   res.json({ ok: true });
+});
+
+/* ---------- settings ---------- */
+/* The reply always carries the whole pane, freshly read, so a client never has
+   to merge a partial response into what it already had - and the login item is
+   re-read from the OS on the way out, which is what makes an external change
+   show up rather than the value we just wrote. */
+const settingsPayload = () => ({ ...SET.load(), launch_at_login: launchStatus() });
+const SETTABLE = ['launch_at_login', ...SET.BOOLEANS];
+
+app.get('/api/settings', (req, res) => res.json(settingsPayload()));
+
+app.post('/api/settings', (req, res) => {
+  const body = (req.body && typeof req.body === 'object') ? req.body : {};
+  const asked = SETTABLE.filter(k => Object.prototype.hasOwnProperty.call(body, k));
+  if (!asked.length) return res.status(400).json({ error: 'no known setting in the request' });
+  for (const key of asked) {
+    if (typeof body[key] !== 'boolean') return res.status(400).json({ error: `${key} must be true or false` });
+  }
+  try {
+    if (asked.includes('launch_at_login')) {
+      /* Refuse rather than pretend: a platform that cannot register a login
+         item must not answer as though the checkbox took. */
+      const state = launchStatus();
+      if (!state.supported) return res.status(409).json({ error: state.reason });
+      launchAgent.set(body.launch_at_login);
+    }
+    const prefs = asked.filter(k => k !== 'launch_at_login');
+    if (prefs.length) SET.patch(Object.fromEntries(prefs.map(k => [k, body[k]])));
+    res.json(settingsPayload());
+  } catch (e) { logErr(e); res.status(500).json({ error: String(e.message || e) }); }
 });
 
 /* ---------- playlists ---------- */
@@ -1443,5 +1538,5 @@ function shutdown() {
   SONOS.stop();
 }
 
-module.exports = { start, shutdown, app, S };
+module.exports = { start, shutdown, setLaunchAgent, app, S };
 if (require.main === module) start();

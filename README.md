@@ -62,14 +62,31 @@ npm install
 npm start
 ```
 
-**On macOS** the app lives in your menu bar rather than the Dock. Click the speaker
-icon to show or hide the window, right-click it for a menu.
+**On macOS** the app lives in your menu bar rather than the Dock. Left- or right-click
+the speaker icon to open its menu. Use the slider for the currently selected speaker
+or group, choose **Open Window** for the full app, or choose
+**Quit (stops auto-refresh)** to exit.
 
 **On Windows** it behaves like a normal app with a taskbar button, and also puts an
-icon in the notification area. Closing the window tucks it away there rather than
-quitting, so your music keeps playing — it tells you the first time so it doesn't
-look like a crash. To actually exit, right-click the notification-area icon and
-choose Quit.
+icon in the notification area. Closing the window tucks it away there instead of
+quitting, so the app keeps running — it tells you the first time. Left- or
+right-click the icon to open the same menu, change the selected speaker or group's
+volume, or choose **Open Window**. To exit, choose **Quit (stops auto-refresh)**.
+
+### Starting it automatically
+
+**Settings** (top right of the window) has **Start at login**: the app opens by
+itself when you sign in, so a speaker is always ready without going looking for
+it. It's off until you turn it on.
+
+Underneath is **Start quietly in the background** — on by default, and it means a
+login start puts the icon in the menu bar (macOS) or notification area (Windows)
+without opening a window. Opening the app yourself still works normally. Turn it
+off if you'd rather see the window every time you sign in.
+
+Whether the app starts at login is remembered by the operating system, not by the
+app, so removing it in **System Settings → General → Login Items** (macOS) or
+**Task Manager → Startup apps** (Windows) works too, and the checkbox will agree.
 
 ### Ready-made installers
 
