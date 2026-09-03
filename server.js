@@ -18,6 +18,7 @@ const SO = require('./sonos.js');
 const WD = require('./watchdog.js');
 const VER = require('./version.js');
 const LAUNCH = require('./launch-at-login.js');
+const YT = require('./youtube.js');
 const {
   DEFAULT_OPERATION_TIMEOUT_MS,
   createVolumeWriteCoordinator,
@@ -68,9 +69,14 @@ const ytdlp = args => new Promise((res, rej) =>
 
 const CTYPE = { m4a: 'audio/mp4', mp4: 'audio/mp4', webm: 'audio/webm', opus: 'audio/ogg', mp3: 'audio/mpeg' };
 
-async function extract(pageUrl) {
+async function extract(rawUrl) {
+  /* Validated here rather than at the routes: every casting path funnels
+     through this function, so this is the one place that cannot be bypassed by
+     a new caller. `--` ends option parsing so nothing after it can be read as
+     a flag, whatever a future edit does to the url. */
+  const pageUrl = YT.pageUrl(rawUrl);
   const out = await ytdlp(['-4', '-f', 'bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio',
-    '--no-warnings', '--no-playlist', '-J', pageUrl]);
+    '--no-warnings', '--no-playlist', '-J', '--', pageUrl]);
   const info = JSON.parse(out);
   const fmt = (info.requested_downloads || [])[0] || {};
   const url = fmt.url || info.url;
@@ -103,8 +109,9 @@ async function oembed(videoId) {
   return r.json();
 }
 
-async function resolveItems(pageUrl) {
-  const info = JSON.parse(await ytdlp(['-4', '--no-warnings', '-J', '--flat-playlist', pageUrl]));
+async function resolveItems(rawUrl) {
+  const pageUrl = YT.pageUrl(rawUrl);
+  const info = JSON.parse(await ytdlp(['-4', '--no-warnings', '-J', '--flat-playlist', '--', pageUrl]));
   const mk = e => ({ video_id: e.id, title: e.title || e.id,
     duration: e.duration || null, url: 'https://www.youtube.com/watch?v=' + e.id,
     thumb: `https://i.ytimg.com/vi/${e.id}/mqdefault.jpg` });
@@ -121,7 +128,8 @@ async function resolveItems(pageUrl) {
 async function identify(title, duration) {
   if (!title) return null;
   try {
-    const ents = (JSON.parse(await ytdlp([`ytsearch8:${title}`, '-J', '--flat-playlist', '--no-warnings']))
+    const ents = (JSON.parse(await ytdlp(['-J', '--flat-playlist', '--no-warnings',
+      '--', `ytsearch8:${title}`]))
       .entries || []).filter(e => e && e.id);
     if (!ents.length) return null;
     if (duration) {
@@ -684,7 +692,7 @@ async function runJob(job) {
     console.log(`[add] ${title.slice(0, 44)} (duration pending)`);
     try {
       const info = JSON.parse(await ytdlp(['-4', '--no-warnings', '--no-playlist', '-J',
-        '--flat-playlist', it.url]));
+        '--flat-playlist', '--', it.url]));
       if (info && info.duration) PL.updateItem(job.playlistId, vid, { duration: info.duration });
     } catch (e) { logErr('duration backfill: ' + e.message); }
     return;
@@ -1141,7 +1149,10 @@ app.post('/api/cast', async (req, res) => {
   const { url, device } = req.body || {};
   if (!url) return res.status(400).json({ error: 'no url' });
   if (!device) return res.status(400).json({ error: 'no device selected' });
-  try { res.json({ ok: true, media: await castUrl(url.trim(), device) }); }
+  let pageUrl;
+  try { pageUrl = YT.pageUrl(url); }
+  catch (e) { return res.status(400).json({ error: String(e.message || e) }); }
+  try { res.json({ ok: true, media: await castUrl(pageUrl, device) }); }
   catch (e) { logErr(e); res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -1350,8 +1361,13 @@ app.delete('/api/playlists/:id', (req, res) => {
 app.post('/api/playlists/:id/add', (req, res) => {
   const url = ((req.body || {}).url || '').trim();
   if (!url) return res.status(400).json({ error: 'no url' });
+  /* Checked before the job is queued: addJob answers instantly and the failure
+     would otherwise surface minutes later in /api/jobs, where nobody is looking. */
+  let pageUrl;
+  try { pageUrl = YT.pageUrl(url); }
+  catch (e) { return res.status(400).json({ error: String(e.message || e) }); }
   if (!PL.get(req.params.id)) return res.status(404).json({ error: 'no such playlist' });
-  const job = addJob(req.params.id, url);
+  const job = addJob(req.params.id, pageUrl);
   res.json({ ok: true, job: job.id, queued: true });   // returns instantly
 });
 
@@ -1458,7 +1474,8 @@ app.post('/api/queue/add', asyncRoute(async (req, res) => {
     if (!pl) return res.status(404).json({ error: 'no such playlist' });
     entries = pl.items;
   } else if (url) {
-    entries = await resolveItems(url);
+    try { entries = await resolveItems(url); }
+    catch (e) { return res.status(400).json({ error: String(e.message || e) }); }
   } else return res.status(400).json({ error: 'no url' });
   if (!entries.length) return res.status(400).json({ error: 'nothing found at that url' });
 
