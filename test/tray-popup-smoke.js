@@ -325,7 +325,10 @@ async function verifyUnavailableStates(window) {
   assert.match(unavailable.controlMessage, /volume is unavailable/i);
 }
 
-async function dispatchVolume(window, value) {
+/* Assistive tech sets the value and commits it without ever touching the
+   pointer, so 'input' and 'change' arrive together at the final value. That is
+   a different path from a drag and both have to keep working. */
+async function dispatchVolumeCommit(window, value) {
   return window.webContents.executeJavaScript(`(() => {
     const slider = document.getElementById('volume');
     slider.value = ${JSON.stringify(String(value))};
@@ -335,7 +338,7 @@ async function dispatchVolume(window, value) {
   })()`);
 }
 
-async function dispatchVolumeBurst(window, values) {
+async function dispatchVolumeCommitBurst(window, values) {
   return window.webContents.executeJavaScript(`(() => {
     const slider = document.getElementById('volume');
     for (const value of ${JSON.stringify(values.map(String))}) {
@@ -390,7 +393,7 @@ async function verifyVolumeResponses(window) {
   const successfulRequestIndex = fixture.controlRequests.length;
 
   // Act - submit 73% through the real range control and production fetch path.
-  await dispatchVolume(window, 73);
+  await dispatchVolumeCommit(window, 73);
   const successfulRequest = await waitFor('successful normalized volume request',
     () => Promise.resolve(fixture.controlRequests[successfulRequestIndex]), Boolean);
   const successReport = await waitFor('successful volume response rendering', () => readPopup(window),
@@ -402,6 +405,9 @@ async function verifyVolumeResponses(window) {
   });
   assert.match(successfulRequest.contentType, /^application\/json/i);
   assert.strictEqual(successReport.controlError, false);
+  await assertStableFor('one commit issued more than one write',
+    () => Promise.resolve(fixture.controlRequests.length),
+    count => count === successfulRequestIndex + 1, 300);
 
   // Arrange - make the deterministic control endpoint reject the next write.
   fixture.controlReply = { status: 503, body: { error: 'fixture rejection' } };
@@ -413,7 +419,7 @@ async function verifyVolumeResponses(window) {
 
   try {
     // Act - submit another valid slider value through the same production path.
-    await dispatchVolume(window, 31);
+    await dispatchVolumeCommit(window, 31);
     const failedRequest = await waitFor('rejected normalized volume request',
       () => Promise.resolve(fixture.controlRequests[failedRequestIndex]), Boolean);
     const failureReport = await waitFor('failed volume response rendering', () => readPopup(window),
@@ -448,6 +454,146 @@ async function verifyVolumeResponses(window) {
   }
 }
 
+/* A drag: the pointer goes down, the value moves several times with no commit
+   in between, and only then is it released. Everything this feature adds lives
+   between the pointerdown and the pointerup. */
+async function dispatchVolumeDragSteps(window, values) {
+  return window.webContents.executeJavaScript(`(() => {
+    const slider = document.getElementById('volume');
+    slider.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    for (const value of ${JSON.stringify(values.map(String))}) {
+      slider.value = value;
+      slider.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    return { disabled: slider.disabled, value: slider.value };
+  })()`);
+}
+
+async function dispatchVolumeDragRelease(window) {
+  return window.webContents.executeJavaScript(`(() => {
+    const slider = document.getElementById('volume');
+    window.dispatchEvent(new Event('pointerup'));
+    slider.dispatchEvent(new Event('change', { bubbles: true }));
+    return { value: slider.value };
+  })()`);
+}
+
+async function verifyLiveDragWrites(window) {
+  // Arrange - a speaker that answers instantly, so nothing here waits on a timeout.
+  await showStatus(window, connectedStatus({
+    device: 'cast:drag-group', device_name: 'Drag Group', volume: 0.10,
+  }), value => !value.volumeDisabled && value.volumeValue === '10', 'live drag baseline');
+  fixture.controlReply = { status: 200, body: { ok: true } };
+  const startIndex = fixture.controlRequests.length;
+
+  // Act - press and move the thumb WITHOUT letting go.
+  await dispatchVolumeDragSteps(window, [30, 45, 60]);
+
+  // Assert - the speaker is already being written to, mid-gesture. This is the
+  // whole feature: before this change nothing was sent until the release.
+  const midDrag = await waitFor('a write issued while the pointer was still down',
+    () => Promise.resolve(fixture.controlRequests.slice(startIndex)),
+    requests => requests.length >= 1, 4000);
+  assert.strictEqual(midDrag[0].body.target, 'cast:drag-group');
+  assert.ok(midDrag[0].body.value > 0.1,
+    `the mid-drag write carried ${midDrag[0].body.value}, not a dragged value`);
+
+  // Act - let go, which also fires the native trailing 'change' at 60.
+  await dispatchVolumeDragRelease(window);
+  const settled = await waitFor('the final dragged value reached the speaker',
+    () => Promise.resolve(fixture.controlRequests.slice(startIndex)),
+    requests => requests.length >= 1
+      && requests[requests.length - 1].body.value === 0.6, 4000);
+
+  // Assert - bounded by the steps taken, never one write per input event, and
+  // the trailing change re-sent nothing because 60 had already gone out.
+  assert.ok(settled.length <= 3,
+    `a three-step drag issued ${settled.length} writes`);
+  await assertStableFor('the trailing change re-sent a value the speaker already had',
+    () => Promise.resolve(fixture.controlRequests.length),
+    count => count === startIndex + settled.length, 300);
+}
+
+async function verifyKeyboardWriteParity(window) {
+  // Arrange - each arrow press fires keydown, input, change and keyup, and only
+  // one of those may become a write.
+  await showStatus(window, connectedStatus({
+    device: 'cast:keys-group', device_name: 'Keys Group', volume: 0.5,
+  }), value => !value.volumeDisabled && value.volumeValue === '50', 'keyboard parity baseline');
+  fixture.controlReply = { status: 200, body: { ok: true } };
+  const startIndex = fixture.controlRequests.length;
+
+  // Act - three deliberate presses, each allowed to settle before the next.
+  for (const step of ['51', '52', '53']) {
+    const before = fixture.controlRequests.length;
+    await window.webContents.executeJavaScript(`(() => {
+      const slider = document.getElementById('volume');
+      slider.focus();
+      slider.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+      slider.value = '${step}';
+      slider.dispatchEvent(new Event('input', { bubbles: true }));
+      slider.dispatchEvent(new Event('change', { bubbles: true }));
+      slider.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowUp', bubbles: true }));
+    })()`);
+    await waitFor(`keypress to ${step} produced a write`,
+      () => Promise.resolve(fixture.controlRequests.length),
+      count => count > before, 4000);
+  }
+
+  // Assert - exactly three writes for three presses. Before the dedupe guard,
+  // input and change would each have written and this would be six.
+  await assertStableFor('an arrow keypress wrote more than once',
+    () => Promise.resolve(fixture.controlRequests.length),
+    count => count === startIndex + 3, 400);
+  assert.deepStrictEqual(
+    fixture.controlRequests.slice(startIndex).map(request => request.body.value),
+    [0.51, 0.52, 0.53]);
+}
+
+async function verifyDragFeedbackStaysQuiet(window) {
+  // Arrange - #control-status is the slider's aria-describedby and a
+  // role="status" live region, so anything written there is spoken.
+  await showStatus(window, connectedStatus({
+    device: 'cast:quiet-group', device_name: 'Quiet Group', volume: 0.2,
+  }), value => !value.volumeDisabled && value.volumeValue === '20', 'drag feedback baseline');
+  fixture.controlReply = { status: 200, body: { ok: true } };
+  const baseline = (await readPopup(window)).controlMessage;
+
+  // Act - drag slowly enough that every write settles mid-gesture, sampling the
+  // live region after each step.
+  const spoken = await window.webContents.executeJavaScript(`(async () => {
+    const slider = document.getElementById('volume');
+    const status = document.getElementById('control-status');
+    const seen = [];
+    const record = () => {
+      const text = status.textContent;
+      if (seen[seen.length - 1] !== text) seen.push(text);
+    };
+    record();
+    slider.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    for (const value of ['30', '40', '50', '60', '70']) {
+      slider.value = value;
+      slider.dispatchEvent(new Event('input', { bubbles: true }));
+      await new Promise(resolve => setTimeout(resolve, 150));
+      record();
+    }
+    return seen;
+  })()`);
+
+  // Assert - it never changed. Each write clears and repaints the message, so
+  // without deferral this alternates baseline / "Volume updated." several times.
+  assert.deepStrictEqual(spoken, [baseline],
+    `the live region churned during a drag: ${JSON.stringify(spoken)}`);
+
+  // Act - let go.
+  await dispatchVolumeDragRelease(window);
+
+  // Assert - the outcome is announced exactly once, on release.
+  const announced = await waitFor('the drag outcome announced after release',
+    () => readPopup(window), value => value.controlMessage === 'Volume updated.', 4000);
+  assert.strictEqual(announced.controlError, false);
+}
+
 async function verifyLatestValueWins(window) {
   // Arrange - make the first production write hang and queue a normal response behind it.
   await showStatus(window, connectedStatus({
@@ -463,10 +609,10 @@ async function verifyLatestValueWins(window) {
 
   try {
     // Act - hold 12% in flight, then replace the single pending slot with a burst ending at 91%.
-    await dispatchVolume(window, 12);
+    await dispatchVolumeCommit(window, 12);
     const firstRequest = await waitFor('hung first volume request',
       () => Promise.resolve(fixture.controlRequests[firstRequestIndex]), Boolean);
-    const burst = await dispatchVolumeBurst(window, [24, 38, 52, 67, 91]);
+    const burst = await dispatchVolumeCommitBurst(window, [24, 38, 52, 67, 91]);
     assert.strictEqual(burst.value, '91');
     await assertStableFor('writer sent a parallel request while the first request was hung',
       () => Promise.resolve(fixture.controlRequests.length),
@@ -550,13 +696,25 @@ async function verifyTargetChangeInvalidatesEdit(window) {
     device: 'cast:interaction-a', device_name: 'Interaction A', volume: 0.28,
   }), value => value.deviceName === 'Interaction A' && value.volumeValue === '28',
   'target-change interaction baseline');
-  const controlRequestCount = fixture.controlRequests.length;
+  const beforeDragIndex = fixture.controlRequests.length;
   await window.webContents.executeJavaScript(`(() => {
     const slider = document.getElementById('volume');
     slider.dispatchEvent(new Event('pointerdown', { bubbles: true }));
     slider.value = '76';
     slider.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
+
+  /* That 'input' is a real write now - the whole point of live drag - and it is
+     aimed at A, which was still selected when it happened. What must never
+     happen is the SAME edit becoming a write for B further down. */
+  const dragRequest = await waitFor('live drag write for the original target',
+    () => Promise.resolve(fixture.controlRequests[beforeDragIndex]), Boolean);
+  assert.deepStrictEqual(dragRequest.body, {
+    action: 'volume', target: 'cast:interaction-a', value: 0.76,
+  });
+  const controlRequestCount = fixture.controlRequests.length;
+  assert.strictEqual(controlRequestCount, beforeDragIndex + 1,
+    'a single drag step should issue exactly one write');
 
   // Act - a status poll selects target B while A's pointer edit is still active.
   const targetB = await showStatus(window, connectedStatus({
@@ -582,6 +740,10 @@ async function verifyTargetChangeInvalidatesEdit(window) {
   await assertStableFor('invalid target-A edit was submitted after target B was selected',
     () => Promise.resolve(fixture.controlRequests.length),
     count => count === controlRequestCount, 300);
+  assert.deepStrictEqual(
+    fixture.controlRequests.filter(request => request.body
+      && request.body.target === 'cast:interaction-b'), [],
+    'a stale edit must never be re-aimed at the newly selected target');
 }
 
 async function readVisibility(window) {
@@ -875,6 +1037,9 @@ async function run() {
     await runCheck('unavailable states', () => verifyUnavailableStates(window));
     await runCheck('transport control', () => verifyTransportControl(window));
     await runCheck('volume responses', () => verifyVolumeResponses(window));
+    await runCheck('live drag writes', () => verifyLiveDragWrites(window));
+    await runCheck('keyboard write parity', () => verifyKeyboardWriteParity(window));
+    await runCheck('drag feedback quiet', () => verifyDragFeedbackStaysQuiet(window));
     await runCheck('latest-value writer', () => verifyLatestValueWins(window));
     await runCheck('polling lockout', () => verifyPollingLockout(window));
     await runCheck('target-change edit', () => verifyTargetChangeInvalidatesEdit(window));

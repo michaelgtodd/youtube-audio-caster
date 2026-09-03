@@ -96,6 +96,8 @@ button:disabled{opacity:.45;cursor:default}
 .msg.ok{background:rgba(15,157,88,.12);color:var(--ok)}
 .meta{font-size:12.5px;color:var(--muted);margin-top:10px;word-break:break-word}
 label.sm{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+/* fixed width so the row does not shuffle as the number changes while dragging */
+.volval{font-variant-numeric:tabular-nums;min-width:3.2em;text-align:right}
 .aud{font-size:11px;background:var(--chip);border-radius:5px;padding:1px 6px;color:var(--muted)}
 #plitems{margin-top:12px;max-height:340px;overflow-y:auto;border-radius:9px}
 #plitems:empty{display:none}
@@ -243,7 +245,9 @@ button.mini.done{background:var(--ok)}
           <button class="ghost ic tog" id="repeat" title="Repeat: off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg><b id="repone">1</b></button>
           <button class="ghost" id="refresh" title="Re-issue an expired CDN url and resume">↻ Refresh stream</button>
           <label class="sm" style="margin-left:auto">vol
-            <input type="range" id="vol" min="0" max="100" value="80" style="width:110px">
+            <input type="range" id="vol" min="0" max="100" value="80" style="width:110px"
+                   aria-label="Speaker volume" aria-valuetext="80 percent">
+            <output id="volval" for="vol" class="volval">80%</output>
           </label>
           <label class="sm"><input type="checkbox" id="showvid" checked> show video</label>
           <button class="ghost mini" id="expand" title="Fill the window (Esc to exit)">⤢ Theater</button>
@@ -512,6 +516,10 @@ async function explainNoSpeakers(){
 
 async function attach(){
   const dev=$('device').value; if(!dev) return;
+  /* Aim at the new speaker now: waiting for the next poll would silently
+     discard a drag started straight after picking one. A wrong guess costs one
+     409 from the server, which the next poll corrects. */
+  VOL_TARGET=dev; volWrite.pending=null; volWrite.last=null;
   const devName=(DEVS.find(d=>(d.key||d.name)===dev)||{}).name||dev;
   try{
     const j=await api('/api/attach',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -587,8 +595,57 @@ $('stop').onclick=()=>confirmReplace('Stopping', async()=>{
   finally{ $('stop').disabled=false; }
 });
 
-$('vol').onchange=e=>api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({action:'volume',value:e.target.value/100})}).catch(()=>{});
+/* The speaker follows the thumb while it moves, rather than jumping once it is
+   let go. Nothing here is on a timer: one write is allowed in flight at a time
+   and the newest value waits in a single pending slot, so the write rate
+   settles at whatever the speaker can actually absorb - quick over Cast, slower
+   through a Sonos group's SOAP call - with no throttle constant to guess wrong.
+   Same shape as the seek bar's scrubbing/seekLock pair further down. */
+let VOL_TARGET=null, volPointer=false, volLock=0, volErrAt=0;
+const volWrite={inFlight:null,pending:null,last:null};
+const volLive=()=>volPointer||!!volWrite.inFlight||!!volWrite.pending||Date.now()<volLock;
+const holdVol=()=>{volLock=Date.now()+650;};
+function paintVol(p){ $('vol').setAttribute('aria-valuetext',p+' percent');
+  $('volval').textContent=p+'%'; }
+function submitVol(){
+  const p=Math.round(Math.max(0,Math.min(100,Number($('vol').value)||0)));
+  paintVol(p);
+  if(!VOL_TARGET) return;          // nothing attached; the server would only 400
+  const value=p/100;
+  /* The speaker is already here. Every drag ends with a 'change' carrying the
+     value its last 'input' already sent, so without this each gesture writes
+     twice for one effect. */
+  if(volWrite.last&&volWrite.last.target===VOL_TARGET&&volWrite.last.value===value) return;
+  volWrite.last={target:VOL_TARGET,value};
+  const w={target:VOL_TARGET,value};
+  if(volWrite.inFlight) volWrite.pending=w; else startVol(w);
+  holdVol();
+}
+function startVol(w){
+  volWrite.inFlight=w;
+  api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'volume',target:w.target,value:w.value}),
+    signal:AbortSignal.timeout(5000)})   // longer than the server's 4s write timeout
+    .catch(e=>{ /* a wedged speaker fails every write of a drag, and the row
+                   under the slider is a message, not a log */
+      if(Date.now()-volErrAt>5000){ volErrAt=Date.now(); tmsg('volume: '+e.message,'err'); } })
+    .finally(()=>{
+      volWrite.inFlight=null;
+      const next=volWrite.pending; volWrite.pending=null;
+      holdVol();
+      /* checked again here, not only when it was queued: a poll can move the
+         selection while a write is waiting its turn */
+      if(next&&next.target===VOL_TARGET) startVol(next);
+    });
+}
+$('vol').addEventListener('pointerdown',()=>{volPointer=true;});
+const volRelease=()=>{ if(volPointer){volPointer=false;holdVol();} };
+window.addEventListener('pointerup',volRelease);
+window.addEventListener('pointercancel',volRelease);
+$('vol').addEventListener('input',submitVol);
+/* Still wired: assistive tech sets the value and fires 'change' alone, with no
+   'input' at all. Dedupe makes the trailing change after a drag cost nothing. */
+$('vol').addEventListener('change',submitVol);
 $('showvid').onchange=e=>{
   if(!e.target.checked){$('playerwrap').classList.add('hide');$('noplayer').classList.remove('hide');
     if(YT_PLAYER&&YT_PLAYER.pauseVideo)YT_PLAYER.pauseVideo();}
@@ -1085,6 +1142,7 @@ $('plqueue').onclick=async()=>{
 async function tick(){
   try{
     const s=await api('/api/status');
+    VOL_TARGET=(typeof s.device==='string'&&s.device)?s.device:null;
     if(!s.connected){ clearVideo('Not connected to a speaker yet. Pick one above.');
                       QTOTAL=0; CURRENT_PROTOCOL=null; QSHUFFLE=false; renderQueue(null); }
     if(s.connected){
@@ -1116,8 +1174,15 @@ async function tick(){
           paintBar(dur? pos/dur : 0);
         }
       }
-      if(typeof s.volume==='number' && document.activeElement!==$('vol'))
-        $('vol').value=Math.round(s.volume*100);
+      /* Bounded by time, not by focus. A range keeps focus after pointerup, so
+         the old activeElement test never released and the slider could sit on a
+         value the speaker had refused; a wheel or trackpad gesture emits 'input'
+         without focusing at all, so it fought the poll instead. */
+      if(typeof s.volume==='number' && !volLive()){
+        const p=Math.round(s.volume*100);
+        $('vol').value=p; paintVol(p);
+        volWrite.last=null;      // the speaker is authoritative again
+      }
       updateLink(s.media && s.media.video_id, pos);
       const q=s.queue;
       QSHUFFLE=!!(q&&q.shuffle);

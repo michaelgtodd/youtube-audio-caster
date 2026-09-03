@@ -50,12 +50,20 @@ app.whenReady().then(async () => {
   await win.loadURL(`http://127.0.0.1:${port}/`);
   await wait(6000);
 
-  const results = await win.webContents.executeJavaScript(`(() => {
+  const results = await win.webContents.executeJavaScript(`(async () => {
     const R = [];
     const check = (name, fn) => {
       try { const d = fn(); R.push({ name, ok: d === true, detail: d === true ? '' : String(d) }); }
       catch (e) { R.push({ name, ok: false, detail: 'threw: ' + e.message }); }
     };
+    /* Same contract as check, for anything that has to be watched across an
+       await. A promise handed to check() is never true, so it would silently
+       fail rather than run. */
+    const acheck = async (name, fn) => {
+      try { const d = await fn(); R.push({ name, ok: d === true, detail: d === true ? '' : String(d) }); }
+      catch (e) { R.push({ name, ok: false, detail: 'threw: ' + e.message }); }
+    };
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
     const FIXTURE = ${JSON.stringify(FIXTURE)};
     const sel = document.getElementById('device');
     const render = () => { sel.innerHTML = deviceOptions(FIXTURE); };
@@ -209,6 +217,99 @@ app.whenReady().then(async () => {
       const m = document.getElementById('msg').textContent.toLowerCase();
       return m.includes('pick a speaker') ? true : 'message was: ' + JSON.stringify(m);
     });
+
+    /* ---- the volume writer -------------------------------------------------
+       Driven through the page's real handlers with fetch stubbed underneath, so
+       what is exercised is the production path: the poll sets the target, the
+       slider's own events do the writing. */
+    const realFetch = window.fetch;
+    let held = [];
+    const installVolumeFixture = device => {
+      held = [];
+      window.fetch = (url, opts) => {
+        const u = String(url);
+        if (u.includes('/api/status')) {
+          return Promise.resolve(new Response(JSON.stringify(device
+            ? { connected: true, protocol: 'cast', device, device_name: 'Vol Fixture',
+                state: 'PLAYING', volume: 0.2, media: {}, queue: null }
+            : { connected: false, protocol: 'cast', device: null }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        }
+        if (u.includes('/api/control')) {
+          let release;
+          const gate = new Promise(r => { release = r; });
+          held.push({ body: JSON.parse(opts.body), release });
+          return gate.then(() => new Response(JSON.stringify({ ok: true }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        }
+        return realFetch(url, opts);
+      };
+    };
+    const waitForTarget = async want => {
+      for (let i = 0; i < 40; i++) {
+        if (VOL_TARGET === want) return true;
+        await sleep(100);
+      }
+      return false;
+    };
+    const drag = values => {
+      const v = document.getElementById('vol');
+      v.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+      for (const value of values) {
+        v.value = String(value);
+        v.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    };
+
+    await acheck('dragging the slider writes during the gesture, one write at a time', async () => {
+      installVolumeFixture('cast:fixture-vol');
+      if (!await waitForTarget('cast:fixture-vol')) return 'the poll never adopted the target';
+      held = [];
+      drag([30, 45, 60, 70]);
+      await sleep(50);
+      // the latch: four input events, exactly one request on the wire
+      if (held.length !== 1) return 'expected 1 in-flight write, got ' + held.length;
+      if (typeof held[0].body.target !== 'string') return 'write carried no target';
+      if (held[0].body.target !== 'cast:fixture-vol') return 'wrong target: ' + held[0].body.target;
+      if (held[0].body.value !== 0.3) return 'first write was ' + held[0].body.value + ', not 0.3';
+      // releasing it must send the newest value, not the queue of everything
+      held[0].release();
+      await sleep(120);
+      if (held.length !== 2) return 'expected the pending write to follow, got ' + held.length;
+      if (held[1].body.value !== 0.7) return 'pending write was ' + held[1].body.value + ', not 0.7';
+      held[1].release();
+      await sleep(120);
+      if (held.length !== 2) return 'the writer kept going after the last value: ' + held.length;
+      // and the trailing native change at the same value must cost nothing
+      document.getElementById('vol').dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(120);
+      if (held.length !== 2) return 'the trailing change re-sent a value already set';
+      window.dispatchEvent(new Event('pointerup'));
+      return true;
+    });
+
+    await acheck('the slider writes nothing when no speaker is attached', async () => {
+      installVolumeFixture(null);
+      if (!await waitForTarget(null)) return 'the poll left a stale target behind';
+      held = [];
+      drag([10, 20, 30, 40, 50, 60, 70, 80, 90]);
+      await sleep(150);
+      window.dispatchEvent(new Event('pointerup'));
+      return held.length === 0 ? true : held.length + ' writes went out with nothing attached';
+    });
+
+    check('the volume readout says what the volume actually is', () => {
+      const v = document.getElementById('vol');
+      v.value = '37';
+      v.dispatchEvent(new Event('input', { bubbles: true }));
+      const out = document.getElementById('volval').textContent;
+      if (out !== '37%') return 'readout says ' + JSON.stringify(out);
+      if (v.getAttribute('aria-valuetext') !== '37 percent')
+        return 'aria-valuetext says ' + v.getAttribute('aria-valuetext');
+      return true;
+    });
+
+    window.fetch = realFetch;
 
     return R;
   })()`);
