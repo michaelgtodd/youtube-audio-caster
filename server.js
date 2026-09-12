@@ -1069,6 +1069,39 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'renderer')));
 
+/* What to say when the picker comes up empty, kept out of the route so the
+   choice can be tested without waiting twelve seconds on real discovery.
+
+   "No players found" is not a fault. It is what every network with no Sonos
+   gear reports, every time, and sonos.js deliberately declines to raise it -
+   see the guard in its refresh error path. Reading it as a discovery failure
+   meant the blocked-network message fired on any run that also found no Cast
+   device, which sent someone hunting through a firewall that was switched off.
+   An empty list and a broken search are different things and now read
+   differently. */
+function emptyDeviceAdvice(platform, discoveryError, sonosError) {
+  const fault = [discoveryError, /no players found/i.test(sonosError || '') ? null : sonosError]
+    .filter(Boolean).join('; ');
+  const multicast = 'Finding Cast and Sonos speakers needs local multicast (UDP ports 5353 and '
+    + '1900). Allow the app through your firewall (Windows usually asks on first run), then '
+    + 'press the refresh button.';
+  if (fault) return { error: 'Cannot search for speakers on this network.',
+    hint: multicast, detail: fault };
+  /* macOS grants local network access per app, and an app that has never been
+     granted it is indistinguishable from a quiet network: the mDNS sockets
+     open, nothing reports an error, queries go out and no speaker ever answers
+     - measured on macOS 26, where the Privacy pane listed every other app on
+     the machine and not this one. There is no fault to read, so an empty list
+     is the only signal there is; name the likeliest cause rather than blaming a
+     firewall that is probably switched off. */
+  if (platform === 'darwin') return { error: 'No speakers answered.',
+    hint: 'If your speakers are switched on, macOS may be withholding local network access. '
+        + 'Open System Settings > Privacy & Security > Local Network and switch YouTube Audio '
+        + 'Caster on - if it is not listed at all, it has never been asked for. Then quit the '
+        + 'app, open it again and press refresh.' };
+  return { error: 'No speakers answered.', hint: multicast };
+}
+
 app.get('/api/devices', async (req, res) => {
   try {
     /* The first answer has to be a settled list. Devices reply to mDNS at their
@@ -1090,15 +1123,10 @@ app.get('/api/devices', async (req, res) => {
       }
     }
     const devices = deviceList();
-    if ((S.discoveryError || SONOS.diagnostics().error) && !devices.length) {
-      return res.json({ devices: [], connected: connected() ? S.device : null, settled: true,
-        active: null, active_count: 0,
-        error: 'Cannot search for speakers on this network.',
-        hint: 'Finding Cast and Sonos speakers needs local multicast (UDP ports 5353 and 1900). Allow the app through '
-            + 'your firewall (Windows usually asks on first run), then press the '
-            + 'refresh button.',
-        detail: [S.discoveryError, SONOS.diagnostics().error].filter(Boolean).join('; ') });
-    }
+    if (!devices.length) return res.json({
+      devices: [], connected: connected() ? S.device : null, settled: true,
+      active: null, active_count: 0,
+      ...emptyDeviceAdvice(process.platform, S.discoveryError, SONOS.diagnostics().error) });
     /* A speaker playing as part of a group looks identical over mDNS to one
        playing alone - say which it is, so picking it is not a surprise. */
     try {
@@ -1538,5 +1566,5 @@ function shutdown() {
   SONOS.stop();
 }
 
-module.exports = { start, shutdown, setLaunchAgent, app, S };
+module.exports = { start, shutdown, setLaunchAgent, emptyDeviceAdvice, app, S };
 if (require.main === module) start();

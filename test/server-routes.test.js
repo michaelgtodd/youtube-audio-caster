@@ -261,3 +261,47 @@ test('a failing login-item write is reported rather than swallowed', async t => 
   assert.strictEqual((await (await fetch(`${baseUrl}/api/settings`)).json())
     .launch_at_login.enabled, false, 'the checkbox must not be left claiming it worked');
 });
+
+/* The advice a caller gets when no speaker turned up. This used to be one
+   condition that could not tell "your search is broken" from "nothing
+   answered", and it got the distinction backwards on the machine it mattered
+   on: a Mac that had never been granted local network access was told to go and
+   check a firewall that was switched off. */
+test('an absence of Sonos gear is not reported as a broken search', () => {
+  // Arrange/Act - what every network without Sonos hardware reports, always.
+  const advice = SERVER.emptyDeviceAdvice('win32', null, 'No players found');
+
+  // Assert - nothing failed, so nothing may claim the search itself cannot run.
+  assert.ok(!/cannot search/i.test(advice.error), `"${advice.error}" still blames the search`);
+  assert.equal(advice.detail, undefined);
+});
+
+test('a real discovery failure still names itself, and carries the cause', () => {
+  const advice = SERVER.emptyDeviceAdvice('darwin',
+    'could not open mDNS on any interface', 'No players found');
+
+  assert.match(advice.error, /cannot search/i);
+  assert.match(advice.detail, /could not open mDNS/);
+  // The benign Sonos line must not pad out the detail of a genuine fault.
+  assert.ok(!/no players found/i.test(advice.detail));
+});
+
+test('a genuine Sonos fault is a fault, unlike an absence of Sonos', () => {
+  const advice = SERVER.emptyDeviceAdvice('darwin', null, 'ssdp socket closed');
+
+  assert.match(advice.error, /cannot search/i);
+  assert.match(advice.detail, /ssdp socket closed/);
+});
+
+test('an empty list on macOS points at local network access, not at the firewall', () => {
+  const advice = SERVER.emptyDeviceAdvice('darwin', null, 'No players found');
+
+  assert.match(advice.hint, /Local Network/);
+  assert.ok(!/firewall/i.test(advice.hint), 'macOS has a privacy grant, not a firewall prompt');
+});
+
+test('an empty list on Windows still points at the firewall, which does block this silently', () => {
+  const advice = SERVER.emptyDeviceAdvice('win32', null, 'No players found');
+
+  assert.match(advice.hint, /firewall/i);
+});

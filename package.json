@@ -35,6 +35,7 @@
     "appId": "com.michaelgtodd.youtube-audio-caster",
     "productName": "YouTube Audio Caster",
     "beforePack": "scripts/before-pack.js",
+    "afterSign": "scripts/after-sign.js",
     "directories": {
       "output": "dist"
     },
@@ -94,7 +95,14 @@
         }
       ],
       "icon": "assets/icon.png",
-      "category": "public.app-category.music"
+      "category": "public.app-category.music",
+      "extendInfo": {
+        "NSLocalNetworkUsageDescription": "YouTube Audio Caster finds Cast and Sonos speakers on your local network so it can hand them the audio from a YouTube video.",
+        "NSBonjourServices": [
+          "_googlecast._tcp",
+          "_sonos._tcp"
+        ]
+      }
     },
     "portable": {
       "artifactName": "${productName}-${version}-Windows-Portable-NoInstall.${ext}"

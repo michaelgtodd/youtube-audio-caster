@@ -108,3 +108,44 @@ test('macOS menu-bar icons provide correctly sized 1x and 2x templates', () => {
   assert.deepStrictEqual(pngDimensions(oneX), [16, 16]);
   assert.deepStrictEqual(pngDimensions(twoX), [32, 32]);
 });
+
+/* macOS will not let an app touch the local network until the user has agreed
+   to it, and it will not ask on the app's behalf unless the bundle says what it
+   wants the network for and which Bonjour services it intends to browse. Get
+   this wrong and there is no error to find: discovery opens cleanly, reports
+   nothing wrong, and no speaker ever answers. */
+test('the macOS build asks for local network access, in words', () => {
+  const info = (pkg.build.mac && pkg.build.mac.extendInfo) || {};
+  const reason = info.NSLocalNetworkUsageDescription;
+
+  assert.ok(reason, 'mac.extendInfo must set NSLocalNetworkUsageDescription');
+  assert.ok(reason.length > 30,
+    'the description is shown in the system prompt - it has to say something');
+});
+
+test('every Bonjour service the app browses is declared to macOS', () => {
+  // Arrange - the service types are whatever server.js actually asks for.
+  const src = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
+  const browsed = [...src.matchAll(/\.find\(\{\s*type:\s*['"]([^'"]+)['"]/g)].map(m => m[1]);
+
+  // Act
+  const declared = (pkg.build.mac.extendInfo || {}).NSBonjourServices || [];
+
+  // Assert - an undeclared type is browsed into silence on macOS 15 and later.
+  assert.ok(browsed.length, 'no mDNS browse found in server.js - has it moved?');
+  for (const type of browsed) {
+    assert.ok(declared.includes(`_${type}._tcp`),
+      `server.js browses _${type}._tcp but NSBonjourServices does not declare it`);
+  }
+});
+
+/* Without a Developer ID electron-builder signs nothing at all, and the stock
+   Electron linker signature that survives says Identifier=Electron with the
+   Info.plist unbound. macOS has nothing to hang a privacy grant on, so the app
+   is never asked for local network access and never shows up in the pane where
+   it could be granted. */
+test('the macOS build re-signs the bundle under the app own identifier', () => {
+  assert.equal(pkg.build.afterSign, 'scripts/after-sign.js');
+  assert.ok(fs.existsSync(path.join(root, 'scripts', 'after-sign.js')),
+    'build.afterSign points at a hook that does not exist');
+});
