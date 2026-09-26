@@ -548,12 +548,44 @@ function confirmReplace(what, go){
   $('noreplace').onclick=()=>msg('');
 }
 
+/* A watch link opened from inside a playlist carries both a video and the
+   list. Which one is meant is asked rather than guessed. The patterns mirror
+   videoIdOf and playlistIdOf in identity.js. */
+function linkParts(u){
+  return { list:(u.match(/[?&]list=([A-Za-z0-9_-]+)/)||[])[1]||null,
+    video:(u.match(/(?:[?&]v=|youtu\.be\/|\/shorts\/|\/embed\/)([A-Za-z0-9_-]{11})/)||[])[1]||null };
+}
+const watchUrl=id=>'https://www.youtube.com/watch?v='+id;
+const listUrl=id=>'https://www.youtube.com/playlist?list='+id;
+function askScope(choices){
+  $('msg').innerHTML=`<div class="msg" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <span>This song is part of a playlist.</span>
+    ${choices.map((c,i)=>`<button class="mini${i?' ghost':''}" data-scope="${i}">${c[0]}</button>`).join('')}
+    <button class="ghost mini" data-scope="x">Cancel</button></div>`;
+  $('msg').querySelectorAll('button[data-scope]').forEach(b=>b.onclick=()=>{
+    msg(''); if(b.dataset.scope!=='x') choices[+b.dataset.scope][1](); });
+}
+
 $('go').onclick=async()=>{
   const url=$('url').value.trim(), device=$('device').value;
   if(!url) return msg('paste a link first','err');
   if(!device) return msg('pick a speaker first','err');
-  confirmReplace('Casting this link', ()=>doCast(url,device));
+  const {list,video}=linkParts(url);
+  const song=()=>confirmReplace('Casting this link', ()=>doCast(video?watchUrl(video):url,device));
+  const whole=()=>confirmReplace('Playing this playlist', ()=>doPlayList(url,device));
+  if(!list) return song();
+  if(!video) return whole();
+  askScope([['Play the playlist from here', whole], ['Play just this song', song]]);
 };
+async function doPlayList(url,device){
+  $('go').disabled=true; msg('loading the playlist onto the speaker…');
+  try{
+    const j=await api('/api/queue/play',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({url,device,repeat:$('repeat').dataset.mode||'off'})});
+    msg(`playing a playlist of ${j.total}`,'ok');
+  }catch(e){ msg(e.message,'err'); }
+  $('go').disabled=false;
+}
 async function doCast(url,device){
   const deviceName=(DEVS.find(d=>(d.key||d.name)===device)||{}).name||device;
   $('go').disabled=true; msg('extracting audio-only stream & sending…');
@@ -1068,14 +1100,21 @@ async function queueAdd(body,where){
   try{
     const j=await api('/api/queue/add',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    where(`queued ${j.added} — ${j.total} in queue`,'ok');
+    where(j.added>1 ? `adding ${j.added} — each appears in the queue as it loads`
+                    : `queued ${j.added} — ${j.total} in queue`,'ok');
   }catch(e){ where(e.message,'err'); }
 }
 $('queueadd').onclick=async()=>{
   const url=$('url').value.trim(); if(!url) return msg('paste a link first','err');
-  $('queueadd').disabled=true; msg('adding to queue…');
-  await queueAdd({url}, (t,c)=>{ msg(t,c); setTimeout(()=>msg(''),2500); });
-  $('url').value=''; $('queueadd').disabled=false;
+  const add=async u=>{
+    $('queueadd').disabled=true; msg('adding to queue…');
+    await queueAdd({url:u}, (t,c)=>{ msg(t,c); setTimeout(()=>msg(''),4000); });
+    $('url').value=''; $('queueadd').disabled=false;
+  };
+  const {list,video}=linkParts(url);
+  if(!(list&&video)) return add(url);
+  askScope([['Queue the whole playlist', ()=>add(listUrl(list))],
+            ['Queue just this song', ()=>add(watchUrl(video))]]);
 };
 $('plqueue').onclick=async()=>{
   if(!CURPL) return plmsg('pick a playlist first','err');

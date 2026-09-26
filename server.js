@@ -24,7 +24,8 @@ const {
   isVolumeTargetCurrent,
   normalizeVolume,
 } = require('./volume-write-coordinator.js');
-const { videoIdOf, isPlaylistUrl, cdnToken, expiryOf, remember, recall } = ID;
+const { videoIdOf, isPlaylistUrl, playlistIdOf, playlistUrlOf, cdnToken, expiryOf,
+        remember, recall } = ID;
 
 const DMR_APP_ID = GRP.SOLO_APP;   // 'CC1AD845' - defined once, next to the group app ids
 const YTDLP = process.env.YTDLP || path.join(__dirname, 'bin', 'yt-dlp');
@@ -726,6 +727,7 @@ const ensureTarget = target => {
   if (target && !targetIsCurrent(target)) throw new Error('queue changed while items were resolving');
 };
 
+const INSERT_TIMEOUT_MS = 15000;
 async function insertBatched(items, target = null) {
   const protocol = target ? target.protocol : S.protocol;
   ensureTarget(target);
@@ -737,7 +739,12 @@ async function insertBatched(items, target = null) {
   const player = target ? target.player : S.player;
   for (let i = 0; i < items.length; i += CQ.BATCH) {
     ensureTarget(target);
-    await p(player, 'queueInsert', items.slice(i, i + CQ.BATCH), {});
+    /* The receiver normally answers in well under a second. One that never
+       answers would otherwise hold this await forever, and the add would go
+       quiet with nothing logged and nothing on the speaker. */
+    await Promise.race([p(player, 'queueInsert', items.slice(i, i + CQ.BATCH), {}),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('speaker did not answer queueInsert')),
+        INSERT_TIMEOUT_MS).unref())]);
     await new Promise(r => setTimeout(r, 400));
   }
 }
@@ -1502,30 +1509,57 @@ app.post('/api/queue/add', asyncRoute(async (req, res) => {
       await syncQueue();
       return;
     }
-    const buf = [];
-    for (const e of entries) {
-      try {
-        buf.push(await (target.protocol === 'sonos' ? asSonosItem(e, true) : asCastItem(e)));
+    /* Insert each item as soon as it resolves, for the same reason the fill in
+       loadQueue does. Holding them for a full batch meant a six track playlist
+       put nothing on the speaker for about a minute - long enough to conclude
+       it had failed and press Play, which superseded the add and dropped
+       everything it had resolved. Progress rides on S.fill so the queue view
+       shows it, unless a load's fill already owns that. */
+    const progress = S.fill ? null : (S.fill = { done: 0, total: entries.length });
+    try {
+      for (const e of entries) {
+        let item = null;
+        try { item = await (target.protocol === 'sonos' ? asSonosItem(e, true) : asCastItem(e)); }
+        catch (err) {
+          if (!targetIsCurrent(target)) throw err;
+          logErr('queue add: ' + err.message);
+        }
         ensureTarget(target);
+        if (item) { await insertBatched([item], target); S.queueActive = true; }
+        if (progress) progress.done++;
       }
-      catch (err) {
-        if (!targetIsCurrent(target)) throw err;
-        logErr('queue add: ' + err.message);
-      }
-      if (buf.length >= CQ.BATCH) await insertBatched(buf.splice(0), target);
-    }
-    if (buf.length) await insertBatched(buf, target);
+    } finally { if (progress && S.fill === progress) S.fill = null; }
     ensureTarget(target);
-    S.queueActive = true;
     await syncQueue();
     console.log(`[queue] appended ${entries.length}`);
   })().catch(async e => {
-    if (!targetIsCurrent(target)) return;
+    if (!targetIsCurrent(target)) {
+      console.log(`[queue] add of ${entries.length} stopped: the queue was replaced`);
+      return;
+    }
     logErr('queue add: ' + e.message);
     if (targetIsCurrent(target) && target.protocol === 'cast' && /MEDIA_SESSION/i.test(e.message)) {
       try { await loadQueue(entries, 0, { repeat: 'off' }); await syncQueue(); } catch {}
     }
   });
+}));
+
+/* Play a YouTube playlist link as a queue. A watch url opened from inside a
+   playlist starts at that song and wraps round, the same order a saved
+   playlist uses when played from the middle. */
+app.post('/api/queue/play', asyncRoute(async (req, res) => {
+  const { url, device, repeat } = req.body || {};
+  const list = url && playlistIdOf(url);
+  if (!list) return res.status(400).json({ error: 'that link is not a playlist' });
+  if (!device) return res.status(400).json({ error: 'no device selected' });
+  const entries = await resolveItems(playlistUrlOf(list));
+  if (!entries.length) return res.status(400).json({ error: 'playlist is empty' });
+  if (S.device !== device || !(S.client || S.sonos)) await connectDevice(device);
+  const vid = videoIdOf(url);
+  const start = Math.max(0, entries.findIndex(e => e.video_id === vid));
+  await loadQueue(entries, start, { repeat: repeat || 'off' });
+  await syncQueue();
+  res.json({ ok: true, total: entries.length, start });
 }));
 
 app.get('/api/diagnostics', (req, res) => res.json({

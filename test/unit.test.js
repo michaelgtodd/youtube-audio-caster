@@ -590,6 +590,17 @@ test('a watch url with a list= is treated as a video, not a playlist', () => {
   assert.strictEqual(isPlaylistUrl('https://www.youtube.com/watch?v=0jb1KpDnzFI'), false);
 });
 
+test('the playlist a watch url was opened from can still be read out of it', () => {
+  const { playlistIdOf, playlistUrlOf } = ID;
+  const u = 'https://www.youtube.com/watch?v=8_VPbRfulB4&list=PLDHSPHUO0Zz4&index=2';
+  assert.strictEqual(playlistIdOf(u), 'PLDHSPHUO0Zz4');
+  assert.strictEqual(playlistIdOf('https://www.youtube.com/playlist?list=PL123'), 'PL123');
+  assert.strictEqual(playlistIdOf('https://www.youtube.com/watch?v=0jb1KpDnzFI'), null);
+  /* the whole list, not the list starting from the song that was open */
+  assert.strictEqual(playlistUrlOf(playlistIdOf(u)),
+    'https://www.youtube.com/playlist?list=PLDHSPHUO0Zz4');
+});
+
 test('REGRESSION: recall must never identify a track by session id', () => {
   /* A Cast session outlives individual tracks, so several videos share one id.
      Recalling by it returned whichever was stored last and put the wrong video

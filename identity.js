@@ -11,6 +11,11 @@ const VID_RE = [/[?&]v=([A-Za-z0-9_-]{11})/, /youtu\.be\/([A-Za-z0-9_-]{11})/,
                 /\/shorts\/([A-Za-z0-9_-]{11})/, /\/embed\/([A-Za-z0-9_-]{11})/];
 const videoIdOf = u => { for (const r of VID_RE) { const m = String(u).match(r); if (m) return m[1]; } return null; };
 const isPlaylistUrl = u => /\/playlist\b/.test(u) || (/[?&]list=/.test(u) && !videoIdOf(u));
+/* A watch url can carry the playlist it was opened from. Whether that means
+   "this song" or "the whole list" is the user's call, so the list id is read
+   out separately rather than folded into isPlaylistUrl. */
+const playlistIdOf = u => (String(u).match(/[?&]list=([A-Za-z0-9_-]+)/) || [])[1] || null;
+const playlistUrlOf = id => 'https://www.youtube.com/playlist?list=' + id;
 
 /* the googlevideo "id" param is an opaque token for the stream - stable across
    re-issued urls for the same video+format, and NOT the youtube video id */
@@ -52,5 +57,5 @@ function recall({ content_id, title, duration } = {}) {
   return null;
 }
 
-module.exports = { setStorePath, videoIdOf, isPlaylistUrl, cdnToken, expiryOf,
+module.exports = { setStorePath, videoIdOf, isPlaylistUrl, playlistIdOf, playlistUrlOf, cdnToken, expiryOf,
                    remember, recall };
