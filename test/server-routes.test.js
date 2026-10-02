@@ -49,6 +49,49 @@ function post(baseUrl, body) {
   });
 }
 
+function postTo(baseUrl, route, body) {
+  return fetch(`${baseUrl}${route}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+/* The routes that take a url from a request body hand it to yt-dlp, which reads
+   a leading dash as an option and has --exec. These prove the front door answers
+   400 rather than letting the string travel; extract() and resolveItems() re-check
+   it as the backstop no future caller can bypass, and every ytdlp call ends its
+   options with `--`. Reaching a speaker is not required to prove any of that -
+   rejection has to happen before anything is connected or queued. */
+test('REGRESSION: routes refuse a url yt-dlp would read as an option', async t => {
+  const server = await listen();
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  t.after(() => close(server));
+
+  const attacks = ['--exec=touch /tmp/pwned', '-o/tmp/anywhere', '--config-locations=/tmp/x.conf'];
+
+  for (const url of attacks) {
+    const cast = await postTo(baseUrl, '/api/cast', { url, device: 'anything' });
+    assert.equal(cast.status, 400, `POST /api/cast accepted ${url}`);
+    assert.match((await cast.json()).error, /not a url/);
+  }
+
+  /* the playlist route answers instantly and does the work in a background job,
+     so a late rejection would be invisible - it has to fail here */
+  const made = await postTo(baseUrl, '/api/playlists', { name: 'Injection' });
+  assert.equal(made.status, 200);
+  const playlistId = (await made.json()).playlist.id;
+  for (const url of attacks) {
+    const add = await postTo(baseUrl, `/api/playlists/${playlistId}/add`, { url });
+    assert.equal(add.status, 400, `playlist add accepted ${url}`);
+  }
+
+  // and a scheme yt-dlp understands but no one should be able to cast
+  const scheme = await postTo(baseUrl, '/api/cast', { url: 'file:///etc/passwd', device: 'anything' });
+  assert.equal(scheme.status, 400);
+  assert.match((await scheme.json()).error, /only http and https/);
+});
+
 test('idle selected Cast target exposes and accepts volume without playback controls', async t => {
   const writes = [];
   const client = {

