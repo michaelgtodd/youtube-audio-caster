@@ -9,6 +9,10 @@
   const STATUS_REQUEST_TIMEOUT_MS = 5000;
   const VOLUME_REQUEST_TIMEOUT_MS = 5000;
   const VOLUME_FEEDBACK_MS = 2200;
+  /* A speaker that has just failed twice in the same gesture is wedged, not
+     busy. Keep painting locally and try once more on release rather than
+     spending the rest of the drag filling /api/errors with the same fault. */
+  const GESTURE_FAILURE_LIMIT = 2;
   const VOLUME_KEYS = new Set([
     'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'End', 'Home', 'PageDown', 'PageUp',
   ]);
@@ -48,6 +52,17 @@
   };
 
   let latestWrite = 0;
+  /* What the speaker was last told, so the trailing 'change' that every drag
+     and every arrow key fires cannot re-send a value that is already set.
+     Cleared wherever a poll repaints authoritatively or the slider goes away,
+     so a speaker moved from another app can still be dragged back to the same
+     number. */
+  let lastSubmittedVolume = null;
+  /* Writing during a drag means a settle every few hundred milliseconds, and
+     announcing each one would flip the aria-live region between the baseline
+     and 'Volume updated.' faster than anyone can read it. Outcomes wait here
+     and are announced once, when the gesture ends. */
+  let owedVolumeOutcome = null;
   let pollInFlight = false;
   let pollRefreshRequested = false;
   let pollTimer = null;
@@ -102,6 +117,7 @@
   function startVolumeEdit(source) {
     clearVolumeEditEndTimer();
     interaction.edit = {
+      failures: 0,
       source,
       target: selectedVolumeTarget,
       valid: Boolean(selectedVolumeTarget),
@@ -133,6 +149,13 @@
 
   function restoreSelectedVolume() {
     if (selectedVolumePercent !== null) paintVolume(selectedVolumePercent);
+  }
+
+  /* The hand is still on the control: a pointer is down or a volume key is
+     held. Distinct from isVolumeInteractionActive, which stays true through the
+     settle window afterwards so polling cannot snap the thumb back. */
+  function isVolumeGestureActive() {
+    return interaction.pointerActive || interaction.keyboardActive;
   }
 
   function isVolumeInteractionActive() {
@@ -185,12 +208,24 @@
     if (write.id !== latestWrite
         || write.target !== selectedVolumeTarget
         || !controlMessage.volumeAvailable) return;
+    /* Mid-gesture this would be overwritten before it could be read, and
+       submitVolume repaints the baseline between writes, so the region would
+       stutter rather than inform. Keep the outcome for the release instead. */
+    if (isVolumeGestureActive()) {
+      owedVolumeOutcome = { isError, message, target: write.target };
+      return;
+    }
+    renderVolumeFeedback(message, isError, write.target);
+  }
+
+  function renderVolumeFeedback(message, isError, target) {
+    if (target !== selectedVolumeTarget || !controlMessage.volumeAvailable) return;
     discardVolumeFeedback();
     const feedback = {
       expiresAt: Date.now() + VOLUME_FEEDBACK_MS,
       isError,
       message,
-      target: write.target,
+      target,
     };
     controlMessage.feedback = feedback;
     renderControlMessage();
@@ -202,6 +237,18 @@
     }, VOLUME_FEEDBACK_MS);
   }
 
+  /* One announcement per gesture, spoken once the hand comes off. A drag whose
+     writes all failed still says so; a drag that worked says so once. */
+  function endVolumeGestureIfIdle() {
+    if (!isVolumeGestureActive()) announceOwedVolumeOutcome();
+  }
+
+  function announceOwedVolumeOutcome() {
+    const owed = owedVolumeOutcome;
+    owedVolumeOutcome = null;
+    if (owed) renderVolumeFeedback(owed.message, owed.isError, owed.target);
+  }
+
   function paintVolume(percent) {
     const rounded = Math.round(clamp(percent, 0, 100));
     elements.volume.value = String(rounded);
@@ -211,6 +258,8 @@
 
   function setVolumeUnavailable() {
     invalidateVolumeEdit();
+    lastSubmittedVolume = null;
+    owedVolumeOutcome = null;
     if (document.activeElement === elements.volume) elements.volume.blur();
     elements.volume.disabled = true;
     interaction.keyboardActive = false;
@@ -243,6 +292,8 @@
     if (targetChanged) {
       invalidateVolumeEdit();
       discardVolumeFeedback();
+      lastSubmittedVolume = null;
+      owedVolumeOutcome = null;
     }
 
     setText(elements.nowPlaying, playbackTitle(status || {}, connected && !hasError));
@@ -269,7 +320,13 @@
     }
 
     elements.volume.disabled = false;
-    if (targetChanged || !isVolumeInteractionActive()) paintVolume(selectedVolumePercent);
+    /* An authoritative repaint means the speaker, not this window, decides
+       what the slider reads - so what we last sent is no longer what it is at,
+       and the same value must be allowed through again. */
+    if (targetChanged || !isVolumeInteractionActive()) {
+      paintVolume(selectedVolumePercent);
+      lastSubmittedVolume = null;
+    }
     setControlBaseline(`Volume for ${status.device_name || 'the selected speaker or group'}.`, false, true);
   }
 
@@ -383,6 +440,7 @@
     } catch {
       succeeded = false;
     }
+    if (write.edit) write.edit.failures = succeeded ? 0 : (write.edit.failures || 0) + 1;
     if (succeeded) showVolumeFeedback('Volume updated.', false, write);
     else showVolumeFeedback('Volume change did not reach the speaker.', true, write);
   }
@@ -407,6 +465,13 @@
 
   function startVolumeWrite(write) {
     volumeWriter.inFlight = write;
+    /* The pending slot outlives the poll that composed it, so a speaker change
+       can land between queueing and sending. Drop the write rather than aiming
+       one speaker's value at another and relying on the server's 409. */
+    if (write.target !== selectedVolumeTarget) {
+      finishVolumeWrite(write);
+      return;
+    }
     syncPendingWriteLock();
     void processVolumeWrite(write).catch(() => {
       showVolumeFeedback('Volume change did not reach the speaker.', true, write);
@@ -424,10 +489,20 @@
     const value = normalizedSliderVolume();
     const target = edit.target;
     if (value === null || !target) return;
+    /* The speaker is already here. Every drag ends with a 'change' carrying the
+       value its last 'input' already sent, and every arrow key fires both, so
+       without this the write count per gesture doubles for no effect. */
+    if (lastSubmittedVolume
+        && lastSubmittedVolume.target === target
+        && lastSubmittedVolume.value === value) return;
+    if (edit.failures >= GESTURE_FAILURE_LIMIT && isVolumeGestureActive()) return;
+    lastSubmittedVolume = { target, value };
 
     const writeId = ++latestWrite;
-    const write = { id: writeId, target, value };
-    clearVolumeFeedback();
+    const write = { edit, id: writeId, target, value };
+    /* Between writes of a live drag the baseline would flash back over the last
+       result; the release announces the outcome instead. */
+    if (!isVolumeGestureActive()) clearVolumeFeedback();
     if (volumeWriter.inFlight) volumeWriter.pending = write;
     else startVolumeWrite(write);
     syncPendingWriteLock();
@@ -439,6 +514,7 @@
     interaction.pointerActive = false;
     holdPolling();
     scheduleVolumeEditEnd();
+    endVolumeGestureIfIdle();
   }
 
   function bindVolumeInteraction() {
@@ -447,6 +523,7 @@
       releasePointerInteraction();
       holdPolling();
       scheduleVolumeEditEnd();
+      endVolumeGestureIfIdle();
     });
     elements.volume.addEventListener('pointerdown', () => {
       startVolumeEdit('pointer');
@@ -454,8 +531,13 @@
     });
     window.addEventListener('pointerup', releasePointerInteraction);
     window.addEventListener('pointercancel', () => {
-      invalidateVolumeEdit();
+      /* The speaker is already at the last dragged value, so snapping the
+         slider back would show a number it is not at. Commit what the gesture
+         reached - dedupe makes this free when the value already went out, and
+         an edit invalidated by a speaker change still restores. Released
+         first, so the failure limit cannot block this last attempt. */
       releasePointerInteraction();
+      submitVolume(interaction.edit);
     });
     elements.volume.addEventListener('keydown', event => {
       if (!VOLUME_KEYS.has(event.key)) return;
@@ -468,6 +550,7 @@
       interaction.keyboardActive = false;
       holdPolling();
       scheduleVolumeEditEnd();
+      endVolumeGestureIfIdle();
     });
     elements.volume.addEventListener('input', () => {
       const edit = ensureVolumeEdit('assistive');
@@ -477,6 +560,12 @@
       }
       paintVolume(Number(elements.volume.value));
       holdPolling();
+      /* Paint first: paintVolume rounds and writes the value back to the
+         element, and submitVolume reads it back out, so what is sent is
+         provably what is shown. The writer's one-in-flight latch is what keeps
+         a drag from flooding the speaker - it self-clocks to whatever the
+         device can absorb, which is why no throttle is needed here. */
+      submitVolume(edit);
     });
     elements.volume.addEventListener('change', () => {
       submitVolume(ensureVolumeEdit('assistive'));
@@ -494,6 +583,14 @@
         interaction.settleUntil = 0;
         invalidateVolumeEdit();
         finishVolumeEdit();
+        /* The panel closes mid-drag every time it loses focus, so a queued
+           write would land at a speaker the user can no longer see, and its
+           outcome would be announced to an empty room. Drop both; the write
+           already in flight is left to finish on its own. */
+        volumeWriter.pending = null;
+        syncPendingWriteLock();
+        lastSubmittedVolume = null;
+        owedVolumeOutcome = null;
         if (statusRequestController) statusRequestController.abort();
         return;
       }

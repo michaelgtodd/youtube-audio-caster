@@ -122,7 +122,9 @@ test('idle selected Cast target exposes and accepts volume without playback cont
   assert.strictEqual(exactTarget.status, 200);
   assert.deepStrictEqual(await exactTarget.json(), { ok: true });
 
-  // The main renderer predates target-bearing writes, so omission remains valid.
+  /* Both renderers name their target now, but omission stays supported: it is
+     the compatibility guarantee for any older client still talking to a
+     running server, so the assertion below must not be relaxed. */
   const omittedTarget = await post(baseUrl, { action: 'volume', value: -0.4 });
   assert.strictEqual(omittedTarget.status, 200);
   assert.deepStrictEqual(await omittedTarget.json(), { ok: true });

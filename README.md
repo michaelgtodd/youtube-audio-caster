@@ -67,6 +67,10 @@ the speaker icon to open its menu. Use the slider for the currently selected spe
 or group, choose **Open Window** for the full app, or choose
 **Quit (stops auto-refresh)** to exit.
 
+Either slider — in the menu or in the main window — moves the speaker as you drag
+it, so you hear the level you are setting instead of setting it blind and finding
+out when you let go.
+
 **On Windows** it behaves like a normal app with a taskbar button, and also puts an
 icon in the notification area. Closing the window tucks it away there instead of
 quitting, so the app keeps running — it tells you the first time. Left- or
